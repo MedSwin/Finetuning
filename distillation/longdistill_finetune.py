@@ -208,7 +208,7 @@ def extract_fields_any(obj, qk, ak, ck, ik, default_instruction: str):
     if isinstance(sft, dict) and ("input" in sft or "instruction" in sft or "output" in sft):
         instruction = sft.get("instruction") or default_instruction
         input_text  = sft.get("input") or ""
-        context     = None
+        context     = obj.get("context") or pick_first(obj, ck)
         gold        = sft.get("output")
         if rid is None: rid = pick_first(obj, DEFAULT_ID)
         return instruction, input_text, context, gold, (rid if rid is not None else None)
@@ -500,9 +500,9 @@ def cmd_distill(args):
                 out_dir=out_dir,
                 q_keys=qk, a_keys=ak, c_keys=ck, id_keys=ik,
             )
-        converted = True
+            converted = True
         # now all has been converted to structured JSONL
-        rows = list(read_jsonl(path))
+        rows = list(read_jsonl(used_path))
         stem = path.stem # keep original name for artifacts
         out_jsonl = dst_dir / f"{stem}_distilled.jsonl"
         soft_path = (soft_dir / f"{stem}_softlabels.jsonl.gz") if soft_dir else None
@@ -581,9 +581,7 @@ def cmd_distill(args):
 # -------- high-level: FINETUNE --------
 def train_val_test_split(rows, train_ratio, val_ratio, test_ratio, seed):
     assert abs(train_ratio+val_ratio+test_ratio-1.0) < 1e-6
-    rng = random.Random(seed); idx=list(range(len(rows))); rng.shuffle(id)
-    # Small typo fix:
-    idx = list(range(len(rows))); rng.shuffle(idx)
+    rng = random.Random(seed); idx = list(range(len(rows))); rng.shuffle(idx)
     n=len(rows); ntr=int(n*train_ratio); nva=int(n*val_ratio)
     tr=idx[:ntr]; va=idx[ntr:ntr+nva]; te=idx[ntr+nva:]
     return [rows[i] for i in tr], [rows[i] for i in va], [rows[i] for i in te]
@@ -666,6 +664,8 @@ def cmd_finetune(args):
         "gradient_accumulation_steps": args.grad_accum,
         "learning_rate": args.lr,
         "weight_decay": args.weight_decay,
+        "warmup_ratio": getattr(args, "warmup_ratio", 0.0),
+        "lr_scheduler_type": getattr(args, "scheduler", "linear"),
         "logging_steps": args.logging_steps,
         "save_steps": args.save_steps,
         "seed": args.seed,
