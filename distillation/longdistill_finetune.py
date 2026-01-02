@@ -78,6 +78,10 @@ def write_jsonl(rows: List[Dict[str, Any]], path: Union[str, Path]):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+def append_jsonl_line(path: Union[str, Path], row: Dict[str, Any]):
+     """Append a single JSON row to JSONL (creates file if missing)."""
+     with open(path, "a", encoding="utf-8") as f:
+         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 def read_jsonl_any(path: Union[str, Path], max_lines: Optional[int] = None) -> List[Dict[str, Any]]:
     p = str(path)
@@ -100,6 +104,65 @@ def read_jsonl_any(path: Union[str, Path], max_lines: Optional[int] = None) -> L
         pass
     return rows
 
+def _as_path_list(maybe: Optional[Union[str, Path]]) -> List[Path]:
+     """Accept file/dir/glob/comma-separated specs -> list of existing files."""
+     if not maybe:
+         return []
+     p = Path(maybe)
+     if p.exists() and p.is_dir():
+         files = sorted(list(p.glob("*.jsonl")) + list(p.glob("*.jsonl.gz")) + list(p.glob("*.gz")))
+         return [f for f in files if f.is_file()]
+     parts = split_csv_or_globs(str(maybe))
+     out: List[Path] = []
+     for part in parts:
+         pp = Path(part)
+         if pp.exists() and pp.is_file():
+             out.append(pp)
+         else:
+             for m in glob.glob(part):
+                 out.append(Path(m))
+     return sorted(list(dict.fromkeys(out)))
+ 
+def load_softlabel_map(softlabel_files: List[Path], max_lines: Optional[int]=None) -> Dict[str, Dict[str, Any]]:
+    """Load teacher soft-labels from JSONL/JSONL.GZ into {id: {topk, steps}}."""
+    m: Dict[str, Dict[str, Any]] = {}
+    for p in softlabel_files:
+        for obj in read_jsonl_any(p, max_lines=max_lines):
+            rid = obj.get("id")
+            steps = obj.get("steps")
+            if rid is None or steps is None:
+                continue
+            m[str(rid)] = {"topk": obj.get("topk"), "steps": steps}
+    return m
+
+def discover_softlabel_files(distilled_jsonls: List[Path]) -> List[Path]:
+    """
+    Best-effort discovery of softlabel sidecars:
+      1) distilled/manifest.json -> datasets[*].softlabels
+      2) sibling ../softlabels/*.gz (common layout)
+    """
+    files: List[Path] = []
+    # (1) manifest.json next to distilled outputs
+    for dj in distilled_jsonls:
+        man = dj.parent / "manifest.json"
+        if man.exists():
+            try:
+                payload = json.loads(man.read_text(encoding="utf-8"))
+                for d in payload.get("datasets", []):
+                    sp = d.get("softlabels")
+                    if sp:
+                        p = Path(sp)
+                        if p.exists():
+                            files.append(p)
+            except Exception:
+                pass
+    # (2) sibling softlabels folder
+    for dj in distilled_jsonls:
+        if dj.parent.name == "distilled":
+            sib = dj.parent.parent / "softlabels"
+            if sib.exists() and sib.is_dir():
+                files += list(sib.glob("*.jsonl")) + list(sib.glob("*.jsonl.gz")) + list(sib.glob("*.gz"))
+    return sorted(list(dict.fromkeys([p for p in files if p.exists() and p.is_file()])))
 
 def glob_many(patterns: List[str]) -> List[Path]:
     out = []
@@ -389,7 +452,14 @@ class DistillDataset(Dataset):
             "prompt_len": used_prompt_len,
             "id": rid,
         }
-        item["soft"] = ex.get("soft_labels") if self.use_soft else None
+        if self.use_soft:
+             # Prefer embedded soft_labels; otherwise fall back to sidecar map by id
+             soft = ex.get("soft_labels")
+             if soft is None and isinstance(self.soft_map, dict):
+                 soft = self.soft_map.get(rid)
+             item["soft"] = soft
+        else:
+             item["soft"] = None
         return item
 
 
@@ -442,12 +512,14 @@ def kd_loss_subset(logits: torch.Tensor, prompt_len: torch.Tensor, soft_batch, t
             mask = (ids_np>=0) & (ids_np<V)
             if not mask.any(): continue
             ids_f = ids_np[mask]; probs_f=probs_np[mask]
-            s=probs_f.sum(); if s<=0: continue
+            s = float(probs_f.sum())
+            if s <= 0:
+                continue
             probs_f = probs_f/s
             ids_t = torch.tensor(ids_f.tolist(), dtype=torch.long, device=dev)
             t_probs = torch.tensor(probs_f.tolist(), dtype=torch.float32, device=dev)
             s_logits_sel = logits[b, start+j, ids_t] / max(1e-6, temperature)
-            s_logsumexp = torch.logsumexp(s_logits_sel, dim=-1, keepdims=True)
+            s_logsumexp = torch.logsumexp(s_logits_sel, dim=-1, keepdim=True)
             s_logp_sel = s_logits_sel - s_logsumexp
             t_logp = torch.log(t_probs + 1e-8)
             kl = torch.sum(t_probs * (t_logp - s_logp_sel))
@@ -471,8 +543,8 @@ class KDTrainer(Trainer):
 
 # -------- high-level: DISTILL --------
 def cmd_distill(args):
-    log = setup_file_logger(Path(args.out_dir)/"distill.log")
     out_dir = ensure_dir(args.out_dir)
+    log = setup_file_logger(out_dir / "distill.log")
     dst_dir = ensure_dir(out_dir/"distilled")
     soft_dir= ensure_dir(out_dir/"softlabels") if (args.command=="soft" and args.topk_logprobs>0) else None
     # expand datasets
@@ -524,19 +596,34 @@ def cmd_distill(args):
             if not prompts: continue
             # hard/soft builder
             try:
-                if args.command=="text":
+                if args.command == "text":
                     gens = generate_texts(tok, model, prompts, args.max_new_tokens, args.temperature)
-                    for gen,ins,inp,rid,gold in zip(gens, instrs, inputs, rids, golds):
+
+                    for gen, ins, inp, rid, gold in zip(gens, instrs, inputs, rids, golds):
                         rec = {
                             "instruction": ins or args.instruction,
-                            "input": inp, "output": gen,
+                            "input": inp,
+                            "output": gen,
                             "source": f"{stem}_distilled_{Path(args.teacher_dir).name}",
-                            "id": rid, "task": "distillation",
-                            "meta": {"gen":{"max_new_tokens":args.max_new_tokens,"temperature":args.temperature,"do_sample":(args.temperature>0.0)}}
+                            "id": rid,
+                            "task": "distillation",
+                            "meta": {
+                                "gen": {
+                                    "max_new_tokens": args.max_new_tokens,
+                                    "temperature": args.temperature,
+                                    "do_sample": (args.temperature > 0.0),
+                                }
+                            },
                         }
-                        if args.include_gold and gold is not None: rec["meta"]["gold"]=gold
-                        write_jsonl([rec], out_jsonl) if not out_jsonl.exists() else open(out_jsonl, "a", encoding="utf-8").write(json.dumps(rec, ensure_ascii=False)+"\n")
-                        merged_out.append(rec); n_emit+=1
+
+                        if args.include_gold and gold is not None:
+                            rec["meta"]["gold"] = gold
+
+                        # append safely
+                        append_jsonl_line(out_jsonl, rec)
+                        merged_out.append(rec)
+                        n_emit += 1
+
                 else:
                     outs = generate_with_scores(tok, model, prompts, args.max_new_tokens, args.temperature)
                     for o,ins,inp,rid,gold in zip(outs, instrs, inputs, rids, golds):
@@ -551,9 +638,15 @@ def cmd_distill(args):
                         if args.include_gold and gold is not None: rec["meta"]["gold"]=gold
                         if args.topk_logprobs>0:
                             soft = topk_logprobs_per_step(o["scores"], o["generated_ids"], args.topk_logprobs)
-                            if soft_f: soft_f.write(json.dumps({"id":rid,"topk":args.topk_logprobs,"steps":soft}, ensure_ascii=False)+"\n")
-                            else: rec["soft_labels"]={"topk":args.topk_logprobs,"steps":soft}
-                        write_jsonl([rec], out_jsonl) if not out_jsonl.exists() else open(out_jsonl,"a",encoding="utf-8").write(json.dumps(rec, ensure_ascii=False)+"\n")
+                            if soft_f:
+                                soft_f.write(json.dumps({"id":rid,"topk":args.topk_logprobs,"steps":soft}, ensure_ascii=False)+"\n")
+                                # store an audit pointer for downstream auto-discovery
+                                rec["soft_labels_ref"] = str(soft_path)
+                                rec["soft_labels_topk"] = int(args.topk_logprobs)
+                            else:
+                                # if no sidecar, embed soft labels directly
+                                rec["soft_labels"]={"topk":args.topk_logprobs,"steps":soft}
+                        append_jsonl_line(out_jsonl, rec)
                         merged_out.append(rec); n_emit+=1
             except Exception as e:
                 log.error(f"[err] dataset={stem} batch_start={start} error={repr(e)}\n{traceback.format_exc()}")
@@ -653,8 +746,26 @@ def cmd_finetune(args):
     model = attach_lora_or_resume(base, args.resume_adapter_dir, args.lora_r, args.lora_alpha, args.lora_dropout, args.target_modules)
     model.print_trainable_parameters()
     # datasets
-    train_ds = DistillDataset(train_rows, tok, {}, False, args.kd_temperature, max_len=args.max_len)
-    val_ds   = DistillDataset(val_rows,   tok, {}, False, args.kd_temperature, max_len=args.max_len) if val_rows else None
+    # KD soft-labels (optional)
+    use_soft = bool(getattr(args, "use_soft_labels", False))
+    if not use_soft:
+        # auto-enable if examples already contain embedded soft labels
+        use_soft = any(isinstance(r.get("soft_labels"), dict) for r in train_rows)
+ 
+    soft_map: Dict[str, Dict[str, Any]] = {}
+    soft_files: List[Path] = []
+    if use_soft:
+        soft_files = _as_path_list(getattr(args, "softlabels", None))
+        if not soft_files:
+            soft_files = discover_softlabel_files(paths)
+        soft_map = load_softlabel_map(soft_files)
+        log.info(f"Soft-labels: enabled={use_soft} files={len(soft_files)} loaded_ids={len(soft_map)}")
+        if len(soft_map) == 0 and not any(isinstance(r.get("soft_labels"), dict) for r in train_rows):
+            log.warning("Soft-labels enabled but none were found. KD will behave like CE-only.")
+ 
+    train_ds = DistillDataset(train_rows, tok, soft_map, use_soft, args.kd_temperature, max_len=args.max_len)
+    val_ds   = DistillDataset(val_rows,   tok, soft_map, use_soft, args.kd_temperature, max_len=args.max_len) if val_rows else None
+
     def collate(b): return pad_to_max(b, tok.pad_token_id)
     # training args
     ta = {
@@ -671,6 +782,7 @@ def cmd_finetune(args):
         "seed": args.seed,
         "report_to": "none",
         "dataloader_pin_memory": False,
+        "remove_unused_columns": False,
         "save_total_limit": 2
     }
     if args.bf16: ta["bf16"]=True
@@ -683,11 +795,27 @@ def cmd_finetune(args):
         ta["greater_is_better"]=False
         ta["save_strategy"]="steps"
     # Configs trainer
-    trainer = Trainer(
-        model=model, args=TrainingArguments(**ta),
-        train_dataset=train_ds, eval_dataset=val_ds, data_collator=collate,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if val_ds else None
-    )
+    if use_soft:
+        trainer = KDTrainer(
+            model=model,
+            args=TrainingArguments(**ta),
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=collate,
+            callbacks=([EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if val_ds else []),
+            kd_weight=getattr(args, "kd_weight", 0.5),
+            kd_temperature=getattr(args, "kd_temperature", 1.0),
+            use_soft_labels=True,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=TrainingArguments(**ta),
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=collate,
+            callbacks=([EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if val_ds else []),
+        )
     # Export trainer
     train_out = trainer.train(resume_from_checkpoint=args.resume_trainer_dir)
     log.info(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
@@ -730,7 +858,10 @@ def cmd_all(args):
         "scheduler": "linear", "eval_steps": args.eval_steps, "save_steps": args.save_steps,
         "logging_steps": args.logging_steps, "max_len": args.max_len,
         "resume_adapter_dir": args.resume_adapter_dir, "resume_trainer_dir": args.resume_trainer_dir,
-        "kd_temperature": 1.0
+        "use_soft_labels": (args.command=="soft") or getattr(args, "use_soft_labels", False),
+        "kd_weight": getattr(args, "kd_weight", 0.5),
+        "kd_temperature": getattr(args, "kd_temperature", 1.0),
+        "softlabels": (str(Path(args.out_dir)/"softlabels") if (args.command=="soft") else getattr(args, "softlabels", None))
     })
     cmd_finetune(fargs)
 
@@ -796,6 +927,12 @@ def build_cli():
     pf.add_argument("--max-len", type=int, default=2048)
     pf.add_argument("--resume-adapter-dir", default=None)
     pf.add_argument("--resume-trainer-dir", default=None)
+    pf.add_argument("--use-soft-labels", action="store_true",
+                    help="Enable KD training using teacher soft-labels (requires embedded soft_labels or softlabels sidecar files).")
+    pf.add_argument("--kd-weight", type=float, default=0.5, help="Weight for KD loss added to CE loss.")
+    pf.add_argument("--kd-temperature", type=float, default=1.0, help="Temperature for KD loss.")
+    pf.add_argument("--softlabels", default=None,
+                    help="Optional: file/dir/glob(s) for softlabels JSONL(.gz). If omitted, auto-discovered from manifest or ../softlabels.")
     pf.set_defaults(func=cmd_finetune)
     # all
     pa = sub.add_parser("all", help="Distill then finetune")
