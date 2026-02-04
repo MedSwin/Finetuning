@@ -1,0 +1,292 @@
+[
+  {
+    "qid": "mq_0000000",
+    "query": "What are the treatments for 16p11.2 deletion syndrome ?",
+    "gold_doc_id": "d_0000000",
+    "cand_doc_ids": [
+      "d_0000189",
+      "d_0000447",
+      "d_0000000",
+      "d_0000735",
+      "d_0001780",
+      "d_0000689",
+      "d_0000255",
+      "d_0001236",
+      "d_0000051",
+      "d_0001657"
+    ],
+    "labels": [
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000001",
+    "query": "What is (are) Speech and Communication Disorders ?",
+    "gold_doc_id": "d_0000001",
+    "cand_doc_ids": [
+      "d_0001043",
+      "d_0001220",
+      "d_0001838",
+      "d_0000130",
+      "d_0001622",
+      "d_0000023",
+      "d_0000696",
+      "d_0001478",
+      "d_0000741",
+      "d_0001197"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000002",
+    "query": "What are the symptoms of Alopecia macular degeneration growth retardation ?",
+    "gold_doc_id": "d_0000002",
+    "cand_doc_ids": [
+      "d_0000201",
+      "d_0000438",
+      "d_0001052",
+      "d_0000223",
+      "d_0001292",
+      "d_0000676",
+      "d_0001807",
+      "d_0001493",
+      "d_0000570",
+      "d_0001760"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000003",
+    "query": "What is (are) Veterans and Military Family Health ?",
+    "gold_doc_id": "d_0000003",
+    "cand_doc_ids": [
+      "d_0000543",
+      "d_0001272",
+      "d_0001804",
+      "d_0001914",
+      "d_0000140",
+      "d_0000488",
+      "d_0001652",
+      "d_0001083",
+      "d_0001321",
+      "d_0000150"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000004",
+    "query": "What are the treatments for Barrett esophagus ?",
+    "gold_doc_id": "d_0000004",
+    "cand_doc_ids": [
+      "d_0000942",
+      "d_0001784",
+      "d_0000783",
+      "d_0001758",
+      "d_0000963",
+      "d_0001906",
+      "d_0000408",
+      "d_0001904",
+      "d_0001583",
+      "d_0000719"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000005",
+    "query": "What are the treatments for glycogen storage disease type 0 ?",
+    "gold_doc_id": "d_0000005",
+    "cand_doc_ids": [
+      "d_0000905",
+      "d_0000005",
+      "d_0001949",
+      "d_0000173",
+      "d_0001609",
+      "d_0000818",
+      "d_0001187",
+      "d_0000659",
+      "d_0001408",
+      "d_0000635"
+    ],
+    "labels": [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000006",
+    "query": "Is tumor necrosis factor receptor-associated periodic syndrome inherited ?",
+    "gold_doc_id": "d_0000006",
+    "cand_doc_ids": [
+      "d_0000012",
+      "d_0001754",
+      "d_0000449",
+      "d_0000040",
+      "d_0000828",
+      "d_0001357",
+      "d_0000892",
+      "d_0001883",
+      "d_0000558",
+      "d_0001196"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000007",
+    "query": "What are the treatments for Prune belly syndrome ?",
+    "gold_doc_id": "d_0000007",
+    "cand_doc_ids": [
+      "d_0001697",
+      "d_0000892",
+      "d_0001655",
+      "d_0000025",
+      "d_0001977",
+      "d_0000758",
+      "d_0001602",
+      "d_0000084",
+      "d_0001036",
+      "d_0000177"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000008",
+    "query": "How to diagnose Parasites - Fascioliasis (Fasciola Infection) ?",
+    "gold_doc_id": "d_0000008",
+    "cand_doc_ids": [
+      "d_0000210",
+      "d_0001705",
+      "d_0001927",
+      "d_0001074",
+      "d_0000397",
+      "d_0001450",
+      "d_0001093",
+      "d_0001683",
+      "d_0001764",
+      "d_0000443"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "qid": "mq_0000009",
+    "query": "What is the outlook for Whipple's Disease ?",
+    "gold_doc_id": "d_0000009",
+    "cand_doc_ids": [
+      "d_0001236",
+      "d_0001326",
+      "d_0000081",
+      "d_0000164",
+      "d_0001860",
+      "d_0000146",
+      "d_0000884",
+      "d_0001410",
+      "d_0001105",
+      "d_0000082"
+    ],
+    "labels": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+]
