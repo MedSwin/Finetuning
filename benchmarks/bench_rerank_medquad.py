@@ -28,11 +28,12 @@ Dependencies:
   pip install -U faiss-cpu      (optional, for retriever mode)
 """
 
-import os, re, gc, time, json, gzip, random, argparse
+import os, re, gc, time, json, gzip, random, argparse, sys, importlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+from contextlib import nullcontext
 
 import numpy as np
 from tqdm import tqdm
@@ -48,7 +49,13 @@ except Exception:
     pass
 
 import torch
-from transformers import AutoTokenizer, AutoConfig, AutoModelForSequenceClassification, AutoModelForCausalLM
+from transformers import (
+    AutoTokenizer,
+    AutoConfig,
+    AutoModel,
+    AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+)
 
 # Optional: Retriever + FAISS
 HAS_FAISS = False
@@ -66,10 +73,10 @@ try:
 except Exception:
     HAS_ST = False
 
-# Optional: FlagEmbedding decoder-only reranker inference
+# Optional: public FlagEmbedding APIs
 HAS_FLAG = False
 try:
-    from FlagEmbedding.inference.reranker.decoder_only.base import BaseLLMReranker
+    from FlagEmbedding import FlagReranker, FlagLLMReranker
     HAS_FLAG = True
 except Exception:
     HAS_FLAG = False
@@ -172,18 +179,21 @@ def build_corpus(examples: List[dict], include_question_in_doc: bool = False) ->
     return docs, doc_ids
 
 def make_random_candidates(examples, n_docs: int, candidates_per_query: int, seed: int) -> Dict[str, Dict]:
+    if n_docs < 2:
+        raise ValueError("Need at least 2 docs to sample negatives.")
     rnd = random.Random(seed)
     out = {}
     for i, ex in enumerate(examples):
         qid = ex["qid"]
         pos_idx = i
-        negs = set()
-        while len(negs) < max(candidates_per_query - 1, 0):
-            j = rnd.randrange(n_docs)
-            if j != pos_idx:
-                negs.add(j)
-        cand_indices = [pos_idx] + list(negs)
+
+        all_negs = [j for j in range(n_docs) if j != pos_idx]
+        n_neg = min(max(candidates_per_query - 1, 0), len(all_negs))
+        negs = rnd.sample(all_negs, k=n_neg)
+
+        cand_indices = [pos_idx] + negs
         rnd.shuffle(cand_indices)
+
         out[qid] = {
             "query": ex["query"],
             "gold_idx": pos_idx,
@@ -191,6 +201,7 @@ def make_random_candidates(examples, n_docs: int, candidates_per_query: int, see
             "labels": [1 if j == pos_idx else 0 for j in cand_indices],
         }
     return out
+
 
 def make_retriever_candidates(examples, docs, embedding_model_name: str, topk: int, batch_size: int, seed: int) -> Dict[str, Dict]:
     if not HAS_ST:
@@ -201,8 +212,26 @@ def make_retriever_candidates(examples, docs, embedding_model_name: str, topk: i
     device = "cuda" if torch.cuda.is_available() else "cpu"
     st = SentenceTransformer(embedding_model_name, device=device)
 
-    # encode corpus
-    doc_emb = st.encode(docs, batch_size=batch_size, convert_to_numpy=True, show_progress_bar=True, normalize_embeddings=True).astype("float32")
+    topk = min(max(1, topk), len(docs))
+
+    # Use query/document-specialized encoders when available
+    if hasattr(st, "encode_document"):
+        doc_emb = st.encode_document(
+            docs,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+        ).astype("float32")
+    else:
+        doc_emb = st.encode(
+            docs,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+        ).astype("float32")
+
     dim = doc_emb.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(doc_emb)
@@ -211,18 +240,40 @@ def make_retriever_candidates(examples, docs, embedding_model_name: str, topk: i
     for i, ex in enumerate(tqdm(examples, desc="Retriever candidates")):
         qid = ex["qid"]
         q = ex["query"]
-        q_emb = st.encode([q], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+
+        if hasattr(st, "encode_query"):
+            q_emb = st.encode_query(
+                [q],
+                batch_size=1,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            ).astype("float32")
+        else:
+            q_emb = st.encode(
+                [q],
+                batch_size=1,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            ).astype("float32")
+
         _, idxs = index.search(q_emb, topk)
-        cand_indices = idxs[0].tolist()
+        cand_indices = [int(x) for x in idxs[0].tolist() if int(x) >= 0]
 
         pos_idx = i
         if pos_idx not in cand_indices:
-            cand_indices[-1] = pos_idx  # force include positive
+            if len(cand_indices) < topk:
+                cand_indices.append(pos_idx)
+            else:
+                cand_indices[-1] = pos_idx
 
         labels = [1 if j == pos_idx else 0 for j in cand_indices]
-        out[qid] = {"query": q, "gold_idx": pos_idx, "cand_indices": cand_indices, "labels": labels}
+        out[qid] = {
+            "query": q,
+            "gold_idx": pos_idx,
+            "cand_indices": cand_indices,
+            "labels": labels,
+        }
     return out
-
 
 # ------------------------- metrics -------------------------
 def dcg(rels: np.ndarray) -> float:
@@ -272,21 +323,72 @@ class ModelResult:
     ranked_scores: List[float]
     ranked_labels: List[int]
 
+
 class BaseAdapter:
     def __init__(self, name: str):
         self.name = name
+
     def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
         raise NotImplementedError
+
+    def score_query_docs(self, query: str, docs: List[str], batch_size: Optional[int] = None) -> List[float]:
+        pairs = [(query, d) for d in docs]
+        if batch_size is None or batch_size <= 0:
+            return self.score_pairs(pairs)
+        scores = []
+        for i in range(0, len(pairs), batch_size):
+            scores.extend(self.score_pairs(pairs[i:i+batch_size]))
+        return scores
+
     def close(self):
         pass
+
 
 class HFCrossEncoderAdapter(BaseAdapter):
     def __init__(self, name: str, model_path: str, device: str, max_length: int, dtype: str = "fp16"):
         super().__init__(name)
         self.device = device
         self.max_length = max_length
+
         self.tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_path, trust_remote_code=True)
+
+        added_pad = False
+        if self.tok.pad_token is None:
+            if self.tok.eos_token is not None:
+                self.tok.pad_token = self.tok.eos_token
+            elif self.tok.sep_token is not None:
+                self.tok.pad_token = self.tok.sep_token
+            else:
+                self.tok.add_special_tokens({"pad_token": "[PAD]"})
+                added_pad = True
+
+        torch_dtype = None
+        if device.startswith("cuda"):
+            if dtype == "bf16":
+                torch_dtype = torch.bfloat16
+            elif dtype == "fp16":
+                torch_dtype = torch.float16
+
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+
+        if added_pad:
+            try:
+                self.model.resize_token_embeddings(len(self.tok))
+            except Exception:
+                pass
+
+        if getattr(self.model.config, "pad_token_id", None) is None and self.tok.pad_token_id is not None:
+            self.model.config.pad_token_id = self.tok.pad_token_id
+
+        model_type = getattr(self.model.config, "model_type", "") or ""
+        if getattr(self.model.config, "is_decoder", False) or model_type.lower() in {"llama", "mistral", "gemma", "qwen2", "gpt2"}:
+            self.tok.padding_side = "left"
+
         self.model.to(device)
         self.model.eval()
 
@@ -295,14 +397,23 @@ class HFCrossEncoderAdapter(BaseAdapter):
         elif dtype == "bf16" and device.startswith("cuda"):
             self.autocast = torch.cuda.amp.autocast(dtype=torch.bfloat16)
         else:
-            self.autocast = torch.autocast(device_type="cpu", enabled=False)
+            self.autocast = nullcontext()
 
     @torch.inference_mode()
     def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
         qs = [p[0] for p in pairs]
         ps = [p[1] for p in pairs]
-        enc = self.tok(qs, ps, truncation=True, max_length=self.max_length, padding=True, return_tensors="pt")
+
+        enc = self.tok(
+            qs,
+            ps,
+            truncation=True,
+            max_length=self.max_length,
+            padding=True,
+            return_tensors="pt",
+        )
         enc = {k: v.to(self.device) for k, v in enc.items()}
+
         with self.autocast:
             out = self.model(**enc)
             logits = out.logits
@@ -310,6 +421,7 @@ class HFCrossEncoderAdapter(BaseAdapter):
                 scores = logits[:, -1]
             else:
                 scores = logits.squeeze(-1)
+
         return scores.detach().float().cpu().tolist()
 
     def close(self):
@@ -318,29 +430,201 @@ class HFCrossEncoderAdapter(BaseAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-class FlagDecoderOnlyAdapter(BaseAdapter):
-    def __init__(self, name: str, model_path: str, use_fp16: bool, batch_size: int, query_max_len: int, max_len: int, cache_dir: Optional[str] = None):
+
+class FlagRerankerAdapter(BaseAdapter):
+    def __init__(self, name: str, model_path: str, use_fp16: bool, batch_size: int, cache_dir: Optional[str] = None):
         super().__init__(name)
         if not HAS_FLAG:
-            raise RuntimeError("FlagEmbedding not installed but required for decoder-only rerankers.")
-        self.r = BaseLLMReranker(
-            model_path,
-            use_fp16=use_fp16,
-            cache_dir=cache_dir,
-            batch_size=batch_size,
-            query_max_length=query_max_len,
-            max_length=max_len,
-            normalize=False,
-        )
+            raise RuntimeError("FlagEmbedding not installed but required for FlagRerankerAdapter.")
+        self.batch_size = batch_size
+        kwargs = {}
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        self.r = FlagReranker(model_path, use_fp16=use_fp16, **kwargs)
 
     def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
-        return self.r.compute_score(pairs, batch_size=self.r.batch_size, max_length=self.r.max_length, query_max_length=self.r.query_max_length)
+        scores = self.r.compute_score([list(x) for x in pairs], batch_size=self.batch_size, normalize=False)
+        if not isinstance(scores, list):
+            scores = [scores]
+        return [float(x) for x in scores]
 
     def close(self):
         del self.r
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+class FlagLLMRerankerAdapter(BaseAdapter):
+    def __init__(
+        self,
+        name: str,
+        model_path: str,
+        use_fp16: bool,
+        use_bf16: bool,
+        batch_size: int,
+        query_max_len: int,
+        max_len: int,
+        cache_dir: Optional[str] = None,
+    ):
+        super().__init__(name)
+        if not HAS_FLAG:
+            raise RuntimeError("FlagEmbedding not installed but required for FlagLLMRerankerAdapter.")
+
+        kwargs = {
+            "batch_size": batch_size,
+            "query_max_length": query_max_len,
+            "max_length": max_len,
+            "normalize": False,
+        }
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        if use_bf16:
+            kwargs["use_bf16"] = True
+        else:
+            kwargs["use_fp16"] = use_fp16
+
+        self.r = FlagLLMReranker(model_path, **kwargs)
+
+    def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
+        scores = self.r.compute_score(
+            [list(x) for x in pairs],
+            batch_size=self.r.batch_size,
+            max_length=self.r.max_length,
+            query_max_length=self.r.query_max_length,
+            normalize=False,
+        )
+        if not isinstance(scores, list):
+            scores = [scores]
+        return [float(x) for x in scores]
+
+    def close(self):
+        del self.r
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class JinaRerankerV3Adapter(BaseAdapter):
+    def __init__(self, name: str, model_path: str, device: str, use_fp16: bool = False, use_bf16: bool = False, max_docs_per_call: int = 64):
+        super().__init__(name)
+        self.device = device
+        self.max_docs_per_call = max_docs_per_call
+
+        kwargs = {"trust_remote_code": True}
+        try:
+            kwargs["dtype"] = "auto"
+            self.model = AutoModel.from_pretrained(model_path, **kwargs)
+        except TypeError:
+            kwargs.pop("dtype", None)
+            if device.startswith("cuda"):
+                if use_bf16:
+                    kwargs["torch_dtype"] = torch.bfloat16
+                elif use_fp16:
+                    kwargs["torch_dtype"] = torch.float16
+            self.model = AutoModel.from_pretrained(model_path, **kwargs)
+
+        try:
+            self.model.to(device)
+        except Exception:
+            pass
+        self.model.eval()
+
+    def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
+        raise NotImplementedError("Use score_query_docs() for jina-reranker-v3.")
+
+    @torch.inference_mode()
+    def score_query_docs(self, query: str, docs: List[str], batch_size: Optional[int] = None) -> List[float]:
+        scores = [float("-inf")] * len(docs)
+
+        for start in range(0, len(docs), self.max_docs_per_call):
+            chunk = docs[start:start + self.max_docs_per_call]
+            results = self.model.rerank(query, chunk, top_n=None)
+            for r in results:
+                scores[start + int(r["index"])] = float(r["relevance_score"])
+
+        return scores
+
+    def close(self):
+        del self.model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class Qwen3VLRerankerAdapter(BaseAdapter):
+    def __init__(
+        self,
+        name: str,
+        model_path: str,
+        device: str,
+        use_fp16: bool = False,
+        use_bf16: bool = False,
+        instruction: str = "Retrieve the most relevant medical answer for the given question.",
+    ):
+        super().__init__(name)
+        self._added_paths = []
+        self.instruction = instruction
+        model_path = str(model_path)
+
+        # Support either a Hugging Face local snapshot or the Qwen repo layout
+        for p in [model_path, str(Path(model_path).parent)]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+                self._added_paths.append(p)
+
+        cls = None
+        errs = []
+        for mod_name in ("src.models.qwen3_vl_reranker", "scripts.qwen3_vl_reranker"):
+            try:
+                mod = importlib.import_module(mod_name)
+                cls = getattr(mod, "Qwen3VLReranker")
+                break
+            except Exception as e:
+                errs.append(f"{mod_name}: {e}")
+
+        if cls is None:
+            raise RuntimeError(
+                "Could not import Qwen3VLReranker from local model repo. "
+                "Ensure model/qwen3-vl-reranker-8b contains the official repo files (src/ or scripts/). "
+                + " | ".join(errs)
+            )
+
+        kwargs = {"model_name_or_path": model_path}
+        if device.startswith("cuda"):
+            if use_bf16:
+                kwargs["torch_dtype"] = torch.bfloat16
+            elif use_fp16:
+                kwargs["torch_dtype"] = torch.float16
+
+        try:
+            kwargs["attn_implementation"] = "flash_attention_2"
+            self.r = cls(**kwargs)
+        except Exception:
+            kwargs.pop("attn_implementation", None)
+            self.r = cls(**kwargs)
+
+    def score_pairs(self, pairs: List[Tuple[str, str]]) -> List[float]:
+        raise NotImplementedError("Use score_query_docs() for Qwen3-VL reranker.")
+
+    def score_query_docs(self, query: str, docs: List[str], batch_size: Optional[int] = None) -> List[float]:
+        inputs = {
+            "instruction": self.instruction,
+            "query": {"text": query},
+            "documents": [{"text": d} for d in docs],
+            "fps": 1.0,
+        }
+        scores = self.r.process(inputs)
+        if isinstance(scores, torch.Tensor):
+            scores = scores.detach().float().cpu().tolist()
+        return [float(x) for x in scores]
+
+    def close(self):
+        del self.r
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 class HFPromptLLMAdapter(BaseAdapter):
     def __init__(self, name: str, model_path: str, device: str, max_input_tokens: int = 1024, max_new_tokens: int = 8):
@@ -368,8 +652,11 @@ class HFPromptLLMAdapter(BaseAdapter):
             enc = self.tok(prompt, return_tensors="pt", truncation=True, max_length=self.max_input_tokens)
             enc = {k: v.to(self.device) for k, v in enc.items()}
             gen = self.model.generate(
-                **enc, max_new_tokens=self.max_new_tokens,
-                do_sample=False, temperature=0.0, top_p=1.0,
+                **enc,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
                 eos_token_id=self.tok.eos_token_id,
             )
             text = self.tok.decode(gen[0], skip_special_tokens=True)
@@ -384,36 +671,75 @@ class HFPromptLLMAdapter(BaseAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+
 def pick_adapter(model_name: str, model_path: str, device: str, args) -> BaseAdapter:
     lname = model_name.lower()
-    # Prefer FlagEmbedding for gemma-based rerankers
-    if ("gemma" in lname and "reranker" in lname) or ("medswin" in lname and "reranker" in lname):
+
+    if "jina-reranker-v3" in lname:
+        return JinaRerankerV3Adapter(
+            name=model_name,
+            model_path=model_path,
+            device=device,
+            use_fp16=args.fp16,
+            use_bf16=args.bf16,
+            max_docs_per_call=args.jina_max_docs_per_call,
+        )
+
+    if "qwen3-vl-reranker" in lname:
+        return Qwen3VLRerankerAdapter(
+            name=model_name,
+            model_path=model_path,
+            device=device,
+            use_fp16=args.fp16,
+            use_bf16=args.bf16,
+            instruction=args.qwen_instruction,
+        )
+
+    if "bge-reranker-v2-m3" in lname:
         if HAS_FLAG:
-            return FlagDecoderOnlyAdapter(
+            return FlagRerankerAdapter(
                 name=model_name,
                 model_path=model_path,
                 use_fp16=args.fp16,
                 batch_size=args.score_batch_size,
-                query_max_len=args.query_max_len,
-                max_len=args.passage_max_len,
                 cache_dir=args.cache_dir,
             )
-    # Try seq-cls
+        dtype = "bf16" if args.bf16 else "fp16" if args.fp16 else "fp32"
+        return HFCrossEncoderAdapter(model_name, model_path, device, args.cross_encoder_max_len, dtype=dtype)
+
+    if ("bge-reranker-v2-gemma" in lname) or ("medswin" in lname and "reranker" in lname):
+        if HAS_FLAG:
+            return FlagLLMRerankerAdapter(
+                name=model_name,
+                model_path=model_path,
+                use_fp16=args.fp16,
+                use_bf16=args.bf16,
+                batch_size=args.score_batch_size,
+                query_max_len=args.query_max_len,
+                max_len=args.query_max_len + args.passage_max_len,
+                cache_dir=args.cache_dir,
+            )
+        dtype = "bf16" if args.bf16 else "fp16" if args.fp16 else "fp32"
+        return HFCrossEncoderAdapter(model_name, model_path, device, args.cross_encoder_max_len, dtype=dtype)
+
     try:
         _ = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         dtype = "bf16" if args.bf16 else "fp16" if args.fp16 else "fp32"
         return HFCrossEncoderAdapter(model_name, model_path, device, args.cross_encoder_max_len, dtype=dtype)
     except Exception:
-        # fallback LLM prompt scoring (slow)
-        return HFPromptLLMAdapter(model_name, model_path, device, max_input_tokens=min(args.cross_encoder_max_len, 1024), max_new_tokens=8)
-
+        return HFPromptLLMAdapter(
+            model_name,
+            model_path,
+            device,
+            max_input_tokens=min(args.cross_encoder_max_len, 1024),
+            max_new_tokens=8,
+        )
 
 # ------------------------- ranking -------------------------
 def rank_one_query(adapter: BaseAdapter, q: str, cand_indices: List[int], docs: List[str], labels: List[int], batch_size: int) -> ModelResult:
-    pairs = [(q, docs[i]) for i in cand_indices]
-    scores = []
-    for i in range(0, len(pairs), batch_size):
-        scores.extend(adapter.score_pairs(pairs[i:i+batch_size]))
+    cand_docs = [docs[i] for i in cand_indices]
+    scores = adapter.score_query_docs(q, cand_docs, batch_size=batch_size)
+
     order = np.argsort(-np.array(scores))
     ranked_idx = [cand_indices[i] for i in order]
     ranked_scores = [float(scores[i]) for i in order]
@@ -481,6 +807,12 @@ def main():
     # scoring
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--score_batch_size", type=int, default=32)
+
+    # jina and qwen instruct
+    ap.add_argument("--jina_max_docs_per_call", type=int, default=64)
+    ap.add_argument("--qwen_instruction", type=str,
+                    default="Retrieve the most relevant medical answer for the given question.")
+
     ap.add_argument("--cross_encoder_max_len", type=int, default=512)
     ap.add_argument("--query_max_len", type=int, default=256)
     ap.add_argument("--passage_max_len", type=int, default=1024)
@@ -493,6 +825,12 @@ def main():
 
     args = ap.parse_args()
     ks = [int(x) for x in args.ks.split(",") if x.strip()]
+
+    # warn topk/ks
+    if args.use_retriever and args.retriever_topk < max(ks):
+        raise ValueError(f"--retriever_topk must be >= max(ks)={max(ks)}")
+    if (not args.use_retriever) and args.candidates_per_query < max(ks):
+        raise ValueError(f"--candidates_per_query must be >= max(ks)={max(ks)}")
 
     data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
