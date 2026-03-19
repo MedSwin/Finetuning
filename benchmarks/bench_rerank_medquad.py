@@ -8,9 +8,10 @@ Dataset:
 
 Key features:
 - Benchmark one or many rerankers in a single run (recommended).
-- Two modes:
+- Three candidate modes:
   (A) Random negatives: 1 positive + (N-1) random negatives
-  (B) Retriever->reranker: build candidates by embedding retriever + FAISS topK
+  (B) Dense retriever -> reranker: embedding retriever + FAISS topK
+  (C) BM25 -> reranker: lexical BM25 topK
 - Clean outputs:
   outputs/benchmarks/<run_name>/
     run_config.json
@@ -22,6 +23,70 @@ Key features:
       per_query_results.jsonl
       plots/*.png (optional)
 
+COMMANDS:
+A) Random Negatives:
+python scripts/bench_rerank_medquad.py \
+  --data_dir data/medquad/processed \
+  --model_dir model \
+  --models \
+    model/bge-reranker-v2-gemma \
+    model/bge-reranker-v2-m3 \
+    model/jina-reranker-v3 \
+    model/qwen3-vl-reranker-8b \
+    model/medswin-reranker-bge-gemma \
+  --run_name medquad_random64 \
+  --max_examples 2000 \
+  --seed 42 \
+  --candidates_per_query 64 \
+  --ks 1,3,5,10 \
+  --device cuda \
+  --fp16 \
+  --score_batch_size 16
+  
+B) Dense retrieval -> reranker:
+python scripts/bench_rerank_medquad.py \
+  --data_dir data/medquad/processed \
+  --model_dir model \
+  --models \
+    model/bge-reranker-v2-gemma \
+    model/bge-reranker-v2-m3 \
+    model/jina-reranker-v3 \
+    model/qwen3-vl-reranker-8b \
+    model/medswin-reranker-bge-gemma \
+  --run_name medquad_dense64 \
+  --max_examples 2000 \
+  --seed 42 \
+  --use_retriever \
+  --retriever_model sentence-transformers/embeddinggemma-300m-medical \
+  --retriever_topk 64 \
+  --retriever_bs 64 \
+  --ks 1,3,5,10 \
+  --device cuda \
+  --fp16 \
+  --score_batch_size 16
+
+C) BM25 → reranker:
+python scripts/bench_rerank_medquad.py \
+  --data_dir data/medquad/processed \
+  --model_dir model \
+  --models \
+    model/bge-reranker-v2-gemma \
+    model/bge-reranker-v2-m3 \
+    model/jina-reranker-v3 \
+    model/qwen3-vl-reranker-8b \
+    model/medswin-reranker-bge-gemma \
+  --run_name medquad_bm25_64 \
+  --max_examples 2000 \
+  --seed 42 \
+  --use_bm25 \
+  --bm25_topk 64 \
+  --bm25_k1 1.5 \
+  --bm25_b 0.75 \
+  --ks 1,3,5,10 \
+  --device cuda \
+  --fp16 \
+  --score_batch_size 16
+  
 Dependencies:
   pip install -U torch transformers sentence-transformers numpy tqdm ujson pyarrow matplotlib
   pip install -U FlagEmbedding  (optional, for decoder-only rerankers)
@@ -80,6 +145,9 @@ try:
     HAS_FLAG = True
 except Exception:
     HAS_FLAG = False
+
+# Optional: BM25 dependency-free implementation below
+HAS_BM25 = True
 
 
 # ------------------------- small utils -------------------------
@@ -177,6 +245,103 @@ def build_corpus(examples: List[dict], include_question_in_doc: bool = False) ->
         docs.append(doc)
         doc_ids.append(f"d_{i:07d}")
     return docs, doc_ids
+
+# ------------------------- BM25 helpers -------------------------
+_WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
+
+def bm25_tokenize(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
+
+class SimpleBM25:
+    """
+    Lightweight Okapi BM25 implementation for candidate generation.
+    Good enough for MedQuAD-sized candidate building without extra deps.
+    """
+    def __init__(self, tokenized_corpus: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.corpus = tokenized_corpus
+        self.k1 = k1
+        self.b = b
+        self.N = len(tokenized_corpus)
+        self.doc_len = np.array([len(doc) for doc in tokenized_corpus], dtype=np.float32)
+        self.avgdl = float(np.mean(self.doc_len)) if self.N > 0 else 0.0
+
+        self.df = defaultdict(int)
+        self.tfs = []
+        for doc in tokenized_corpus:
+            tf = defaultdict(int)
+            seen = set()
+            for tok in doc:
+                tf[tok] += 1
+                if tok not in seen:
+                    self.df[tok] += 1
+                    seen.add(tok)
+            self.tfs.append(tf)
+
+        self.idf = {}
+        for tok, df in self.df.items():
+            # Standard BM25 idf
+            self.idf[tok] = float(np.log(1.0 + (self.N - df + 0.5) / (df + 0.5)))
+
+    def get_scores(self, query_tokens: List[str]) -> np.ndarray:
+        scores = np.zeros(self.N, dtype=np.float32)
+        if self.N == 0:
+            return scores
+
+        q_terms = query_tokens
+        for i, tf in enumerate(self.tfs):
+            dl = self.doc_len[i]
+            denom_const = self.k1 * (1.0 - self.b + self.b * (dl / max(self.avgdl, 1e-9)))
+            s = 0.0
+            for tok in q_terms:
+                if tok not in tf:
+                    continue
+                f = tf[tok]
+                idf = self.idf.get(tok, 0.0)
+                s += idf * (f * (self.k1 + 1.0)) / (f + denom_const)
+            scores[i] = s
+        return scores
+
+
+def make_bm25_candidates(
+    examples,
+    docs,
+    topk: int,
+    bm25_k1: float = 1.5,
+    bm25_b: float = 0.75,
+) -> Dict[str, Dict]:
+    if not HAS_BM25:
+        raise RuntimeError("BM25 support unavailable.")
+
+    topk = min(max(1, topk), len(docs))
+
+    tokenized_docs = [bm25_tokenize(d) for d in docs]
+    bm25 = SimpleBM25(tokenized_docs, k1=bm25_k1, b=bm25_b)
+
+    out = {}
+    for i, ex in enumerate(tqdm(examples, desc="BM25 candidates")):
+        qid = ex["qid"]
+        q = ex["query"]
+        q_tokens = bm25_tokenize(q)
+
+        scores = bm25.get_scores(q_tokens)
+        idxs = np.argsort(-scores)[:topk].tolist()
+        cand_indices = [int(x) for x in idxs]
+
+        pos_idx = i
+        if pos_idx not in cand_indices:
+            if len(cand_indices) < topk:
+                cand_indices.append(pos_idx)
+            else:
+                cand_indices[-1] = pos_idx
+
+        labels = [1 if j == pos_idx else 0 for j in cand_indices]
+        out[qid] = {
+            "query": q,
+            "gold_idx": pos_idx,
+            "cand_indices": cand_indices,
+            "labels": labels,
+        }
+    return out
 
 def make_random_candidates(examples, n_docs: int, candidates_per_query: int, seed: int) -> Dict[str, Dict]:
     if n_docs < 2:
@@ -551,7 +716,6 @@ class JinaRerankerV3Adapter(BaseAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-
 class Qwen3VLRerankerAdapter(BaseAdapter):
     def __init__(
         self,
@@ -560,14 +724,13 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         device: str,
         use_fp16: bool = False,
         use_bf16: bool = False,
-        instruction: str = "Retrieve the most relevant medical answer for the given question.",
+        instruction: str = "Given a medical question, score how relevant each candidate answer passage is for answering it accurately and directly.",
     ):
         super().__init__(name)
         self._added_paths = []
         self.instruction = instruction
         model_path = str(model_path)
 
-        # Support either a Hugging Face local snapshot or the Qwen repo layout
         for p in [model_path, str(Path(model_path).parent)]:
             if p not in sys.path:
                 sys.path.insert(0, p)
@@ -608,23 +771,31 @@ class Qwen3VLRerankerAdapter(BaseAdapter):
         raise NotImplementedError("Use score_query_docs() for Qwen3-VL reranker.")
 
     def score_query_docs(self, query: str, docs: List[str], batch_size: Optional[int] = None) -> List[float]:
-        inputs = {
-            "instruction": self.instruction,
-            "query": {"text": query},
-            "documents": [{"text": d} for d in docs],
-            "fps": 1.0,
-        }
-        scores = self.r.process(inputs)
-        if isinstance(scores, torch.Tensor):
-            scores = scores.detach().float().cpu().tolist()
-        return [float(x) for x in scores]
+        # Qwen3-VL-Reranker is pairwise in spirit; chunking keeps memory stable.
+        bs = batch_size if batch_size and batch_size > 0 else len(docs)
+        scores_all = []
+
+        for i in range(0, len(docs), bs):
+            chunk = docs[i:i + bs]
+            inputs = {
+                "instruction": self.instruction,
+                "query": {"text": query},
+                "documents": [{"text": d} for d in chunk],
+                "fps": 1.0,
+            }
+            scores = self.r.process(inputs)
+            if isinstance(scores, torch.Tensor):
+                scores = scores.detach().float().cpu().tolist()
+            scores_all.extend([float(x) for x in scores])
+
+        return scores_all
 
     def close(self):
         del self.r
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
+            
 
 class HFPromptLLMAdapter(BaseAdapter):
     def __init__(self, name: str, model_path: str, device: str, max_input_tokens: int = 1024, max_new_tokens: int = 8):
@@ -740,7 +911,12 @@ def rank_one_query(adapter: BaseAdapter, q: str, cand_indices: List[int], docs: 
     cand_docs = [docs[i] for i in cand_indices]
     scores = adapter.score_query_docs(q, cand_docs, batch_size=batch_size)
 
-    order = np.argsort(-np.array(scores))
+    if len(scores) != len(cand_indices):
+        raise RuntimeError(
+            f"{adapter.name} returned {len(scores)} scores for {len(cand_indices)} candidates"
+        )
+
+    order = np.argsort(-np.array(scores, dtype=np.float32))
     ranked_idx = [cand_indices[i] for i in order]
     ranked_scores = [float(scores[i]) for i in order]
     ranked_labels = [int(labels[i]) for i in order]
@@ -799,10 +975,18 @@ def main():
 
     # candidates
     ap.add_argument("--candidates_per_query", type=int, default=64)
+
+    # dense retriever -> reranker
     ap.add_argument("--use_retriever", action="store_true")
     ap.add_argument("--retriever_model", type=str, default="sentence-transformers/embeddinggemma-300m-medical")
     ap.add_argument("--retriever_topk", type=int, default=64)
     ap.add_argument("--retriever_bs", type=int, default=64)
+
+    # BM25 -> reranker
+    ap.add_argument("--use_bm25", action="store_true")
+    ap.add_argument("--bm25_topk", type=int, default=64)
+    ap.add_argument("--bm25_k1", type=float, default=1.5)
+    ap.add_argument("--bm25_b", type=float, default=0.75)
 
     # scoring
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -810,8 +994,11 @@ def main():
 
     # jina and qwen instruct
     ap.add_argument("--jina_max_docs_per_call", type=int, default=64)
-    ap.add_argument("--qwen_instruction", type=str,
-                    default="Retrieve the most relevant medical answer for the given question.")
+    ap.add_argument(
+        "--qwen_instruction",
+        type=str,
+        default="Given a medical question, score how relevant each candidate answer passage is for answering it accurately and directly."
+    )
 
     ap.add_argument("--cross_encoder_max_len", type=int, default=512)
     ap.add_argument("--query_max_len", type=int, default=256)
@@ -826,18 +1013,33 @@ def main():
     args = ap.parse_args()
     ks = [int(x) for x in args.ks.split(",") if x.strip()]
 
-    # warn topk/ks
-    if args.use_retriever and args.retriever_topk < max(ks):
-        raise ValueError(f"--retriever_topk must be >= max(ks)={max(ks)}")
-    if (not args.use_retriever) and args.candidates_per_query < max(ks):
-        raise ValueError(f"--candidates_per_query must be >= max(ks)={max(ks)}")
+    # aggregation retriever vs bm25
+    if args.use_retriever and args.use_bm25:
+        raise ValueError("Choose only one of --use_retriever or --use_bm25")
+
+    if args.use_retriever:
+        if args.retriever_topk < max(ks):
+            raise ValueError(f"--retriever_topk must be >= max(ks)={max(ks)}")
+    elif args.use_bm25:
+        if args.bm25_topk < max(ks):
+            raise ValueError(f"--bm25_topk must be >= max(ks)={max(ks)}")
+    else:
+        if args.candidates_per_query < max(ks):
+            raise ValueError(f"--candidates_per_query must be >= max(ks)={max(ks)}")
 
     data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
 
     # run naming
-    mode = "retriever" if args.use_retriever else f"neg{args.candidates_per_query}"
+    if args.use_retriever:
+        mode = "retriever"
+    elif args.use_bm25:
+        mode = "bm25"
+    else:
+        mode = f"neg{args.candidates_per_query}"
+
     retr_slug = slugify(Path(args.retriever_model).name if args.use_retriever else "none")
+    
     tag = slugify(args.tag) if args.tag else None
     if args.run_name:
         run_name = slugify(args.run_name)
@@ -845,6 +1047,8 @@ def main():
         parts = ["medquad", mode, f"N{args.max_examples}", f"seed{args.seed}"]
         if args.use_retriever:
             parts.append(f"retr_{retr_slug}_K{args.retriever_topk}")
+        elif args.use_bm25:
+            parts.append(f"bm25_K{args.bm25_topk}")
         if tag:
             parts.append(tag)
         parts.append(str(int(time.time())))
@@ -863,8 +1067,24 @@ def main():
 
     # 3) candidates
     if args.use_retriever:
-        print("[cand] building candidates via retriever ...")
-        candidates = make_retriever_candidates(examples, docs, args.retriever_model, args.retriever_topk, args.retriever_bs, args.seed)
+        print("[cand] building candidates via dense retriever ...")
+        candidates = make_retriever_candidates(
+            examples,
+            docs,
+            args.retriever_model,
+            args.retriever_topk,
+            args.retriever_bs,
+            args.seed,
+        )
+    elif args.use_bm25:
+        print("[cand] building candidates via BM25 ...")
+        candidates = make_bm25_candidates(
+            examples,
+            docs,
+            topk=args.bm25_topk,
+            bm25_k1=args.bm25_k1,
+            bm25_b=args.bm25_b,
+        )
     else:
         print("[cand] building candidates via random negatives ...")
         candidates = make_random_candidates(examples, len(docs), args.candidates_per_query, args.seed)
