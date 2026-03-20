@@ -105,15 +105,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite output file if it exists.",
+        help="Overwrite output file if it exists (only if skip-rebuild is False).",
     )
     parser.add_argument(
         "--replace-original-fields",
         action="store_true",
-        help=(
-            "Replace prompt and ideal_completions_data['ideal_completion'] with the processed text. "
-            "When enabled, processed_* duplicate fields are not added."
-        ),
+        help="Replace prompt and ideal_completion with processed text.",
+    )
+    parser.add_argument(
+        "--skip-rebuild",
+        action="store_true",
+        default=True,
+        help="Skip records already found in the output file (default: True).",
+    )
+    parser.add_argument(
+        "--no-skip-rebuild",
+        action="store_false",
+        dest="skip_rebuild",
+        help="Disable skipping and rebuild everything.",
     )
     return parser.parse_args()
 
@@ -470,8 +479,25 @@ def main() -> int:
     )
 
     processed_rows: List[Dict[str, Any]] = []
+    existing_ids = set()
+    skipped_records = []
+
+    # Checkpoint: Load existing progress
+    if args.skip_rebuild and os.path.exists(args.output):
+        print(f"Loading existing checkpoint from {args.output}...", file=sys.stderr)
+        for row in iter_jsonl(args.output):
+            processed_rows.append(row)
+            if "prompt_id" in row:
+                existing_ids.add(row["prompt_id"])
+        print(f"Found {len(existing_ids)} existing records. Skipping those.", file=sys.stderr)
+
     total = 0
     for idx, record in enumerate(iter_jsonl(args.input), start=1):
+        prompt_id = record.get("prompt_id", f"row_{idx}")
+        
+        if prompt_id in existing_ids:
+            continue
+
         try:
             processed = process_record(
                 record=record,
@@ -483,14 +509,31 @@ def main() -> int:
             if idx % 10 == 0:
                 print(f"Processed {idx} rows...", file=sys.stderr)
         except Exception as e:
-            prompt_id = record.get("prompt_id", f"row_{idx}")
-            print(f"Failed on {prompt_id}: {e}", file=sys.stderr)
-            raise
+            # Catch Azure safety filters or other errors and keep moving
+            error_msg = str(e).split('\n')[0] # Get just the first line of the error
+            print(f"Skipping {prompt_id} due to error: {error_msg}", file=sys.stderr)
+            skipped_records.append({"id": prompt_id, "error": error_msg})
+            continue
 
+    # Write full output (existing + new)
     write_jsonl(args.output, processed_rows, mode="w")
-    print(f"Done. Wrote {total} rows to {args.output}")
+    
+    print("-" * 30)
+    print(f"Done. Successfully processed {total} new rows.")
+    print(f"Total rows in {args.output}: {len(processed_rows)}")
+    
+    if skipped_records:
+        print(f"\n[!] SKIPPED {len(skipped_records)} RECORDS DUE TO ERRORS:")
+        for item in skipped_records:
+            print(f" - {item['id']}: {item['error']}")
+    print("-" * 30)
+    
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Progress saved in memory (but not yet written to file).", file=sys.stderr)
+        sys.exit(1)
