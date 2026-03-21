@@ -34,7 +34,8 @@ python3 prep_healthbench.py \
   --output healthbench_processed.jsonl \
   --cache healthbench_cache.jsonl \
   --llm-log healthbench_llm_logs.jsonl \
-  --deployment gpt-5-nano
+  --deployment gpt-5-nano \
+  --replace-original-fields
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ import os
 import re
 import sys
 import time
+from tqdm import tqdm
 from typing import Any, Dict, Iterable, List, Optional
 
 from openai import AzureOpenAI
@@ -439,23 +441,15 @@ def process_record(
 def main() -> int:
     args = parse_args()
 
-    if os.path.exists(args.output) and not args.overwrite:
-        print(
-            f"Output already exists: {args.output}\n"
-            "Use --overwrite to replace it.",
-            file=sys.stderr,
-        )
+    if os.path.exists(args.output) and not args.overwrite and not args.skip_rebuild:
+        print(f"Output already exists: {args.output}. Use --overwrite or --skip-rebuild.", file=sys.stderr)
         return 2
 
+    # Initialize Client & Processor
     endpoint = os.getenv("AZURE_AI_FOUNDRY_ENDPOINT")
     api_key = os.getenv("AZURE_AI_FOUNDRY_API_KEY")
     if not endpoint or not api_key:
-        print(
-            "Missing Azure credentials. Please set:\n"
-            "  AZURE_AI_FOUNDRY_ENDPOINT\n"
-            "  AZURE_AI_FOUNDRY_API_KEY",
-            file=sys.stderr,
-        )
+        print("Missing Azure credentials.", file=sys.stderr)
         return 2
 
     client = build_client(endpoint=endpoint, api_key=api_key, api_version=args.api_version)
@@ -472,62 +466,75 @@ def main() -> int:
         log_path=args.llm_log,
     )
 
-    processed_rows: List[Dict[str, Any]] = []
+    # 1. Check existing progress
     existing_ids = set()
-    skipped_records = []
-
-    # Checkpoint: Load existing progress
-    if args.skip_rebuild and os.path.exists(args.output):
-        print(f"Loading existing checkpoint from {args.output}...", file=sys.stderr)
+    if os.path.exists(args.output):
+        print(f"Scanning existing output for resumability...", file=sys.stderr)
         for row in iter_jsonl(args.output):
-            processed_rows.append(row)
             if "prompt_id" in row:
                 existing_ids.add(row["prompt_id"])
-        print(f"Found {len(existing_ids)} existing records. Skipping those.", file=sys.stderr)
 
-    total = 0
-    for idx, record in enumerate(iter_jsonl(args.input), start=1):
-        prompt_id = record.get("prompt_id", f"row_{idx}")
-        
-        if prompt_id in existing_ids:
-            continue
-
-        try:
-            processed = process_record(
-                record=record,
-                processor=processor,
-                replace_original_fields=args.replace_original_fields,
-            )
-            processed_rows.append(processed)
-            total += 1
-            if idx % 10 == 0:
-                print(f"Processed {idx} rows...", file=sys.stderr)
-        except Exception as e:
-            # Catch Azure safety filters or other errors and keep moving
-            error_msg = str(e).split('\n')[0] # Get just the first line of the error
-            print(f"Skipping {prompt_id} due to error: {error_msg}", file=sys.stderr)
-            skipped_records.append({"id": prompt_id, "error": error_msg})
-            continue
-
-    # Write full output (existing + new)
-    write_jsonl(args.output, processed_rows, mode="w")
+    # 2. Pre-count total rows for the progress bar
+    print(f"Counting total records in {args.input}...", file=sys.stderr)
+    total_records = sum(1 for _ in open(args.input, 'r', encoding='utf-8'))
     
+    total_new_processed = 0
+    skipped_records = []
+    checkpoint_buffer = []
+    checkpoint_interval = 10
+
+    # 3. Process records with tqdm
+    try:
+        with tqdm(total=total_records, desc="Processing HealthBench", unit="row") as pbar:
+            for idx, record in enumerate(iter_jsonl(args.input), start=1):
+                prompt_id = record.get("prompt_id", f"row_{idx}")
+                
+                if prompt_id in existing_ids:
+                    pbar.update(1)
+                    continue
+
+                try:
+                    processed = process_record(
+                        record=record,
+                        processor=processor,
+                        replace_original_fields=args.replace_original_fields,
+                    )
+                    checkpoint_buffer.append(processed)
+                    total_new_processed += 1
+
+                    # Checkpoint logic
+                    if len(checkpoint_buffer) >= checkpoint_interval:
+                        write_jsonl(args.output, checkpoint_buffer, mode="a")
+                        checkpoint_buffer = []
+                    
+                    pbar.set_postfix({"new": total_new_processed, "err": len(skipped_records)})
+                    pbar.update(1)
+
+                except Exception as e:
+                    error_msg = str(e).split('\n')[0]
+                    # Use tqdm.write so the log doesn't break the progress bar
+                    tqdm.write(f"Skipping {prompt_id} due to error: {error_msg}")
+                    skipped_records.append({"id": prompt_id, "error": error_msg})
+                    pbar.update(1)
+                    continue
+
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted. Saving progress...", file=sys.stderr)
+    finally:
+        # 4. Final Flush
+        if checkpoint_buffer:
+            write_jsonl(args.output, checkpoint_buffer, mode="a")
+            print(f"Final flush: Saved {len(checkpoint_buffer)} rows.", file=sys.stderr)
+
     print("-" * 30)
-    print(f"Done. Successfully processed {total} new rows.")
-    print(f"Total rows in {args.output}: {len(processed_rows)}")
-    
-    if skipped_records:
-        print(f"\n[!] SKIPPED {len(skipped_records)} RECORDS DUE TO ERRORS:")
-        for item in skipped_records:
-            print(f" - {item['id']}: {item['error']}")
+    print(f"Run Complete.")
+    print(f" - New rows added: {total_new_processed}")
+    print(f" - Skipped (errors): {len(skipped_records)}")
+    print(f" - Output file: {args.output}")
     print("-" * 30)
     
     return 0
 
-
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Progress saved in memory (but not yet written to file).", file=sys.stderr)
-        sys.exit(1)
+    # Simplified caller since main() now handles its own interrupts safely
+    sys.exit(main())
