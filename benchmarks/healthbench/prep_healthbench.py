@@ -55,28 +55,22 @@ API_VERSION = "2024-12-01-preview"
 DEFAULT_DEPLOYMENT = "gpt-5-nano"
 
 
-SYSTEM_PROMPT = """You are a careful medical-text preprocessing assistant.
+SYSTEM_PROMPT = """You are a medical data extraction and translation engine. 
 
-Your job is to transform ONE input field at a time.
+Your task is to convert the input field into a concise, English plaintext summary. 
 
-Rules:
-1. First determine whether the input is fully English. If it contains meaningful non-English content, translate it into natural, faithful English.
-2. Preserve all medical facts, warnings, relationships, timing, uncertainty, numbers, units, and clinical context.
-3. Remove markdown, tables, headings, HTML, and decorative formatting. Return plain text only.
-4. Bullets are allowed only if needed for clarity, but keep formatting minimal.
-5. If the text is long, compress it to a concise version that preserves all important facts.
-6. Target length: roughly {min_words}-{max_words} words when compression is needed.
-7. If the text is already short and clear, do not pad it. Keep it faithful.
-8. Never invent facts. Never omit medically important details.
-9. Return ONLY the transformed plaintext. No preamble, no labels, no JSON, no markdown fences.
+Strict Requirements:
+1. LANGUAGE: If the input is not English, translate it faithfully to English.
+2. CONTENT: Preserve every medical fact, vital sign, date, medication, and clinical uncertainty. 
+3. STRIP: Remove all greetings, apologies, conversational filler, markdown, tables, and HTML. 
+4. COMPRESSION: If the text is long, summarize it to {min_words}-{max_words} words. If it is already shorter than {max_words} words, do not add any text.
+5. FORMAT: Return ONLY the raw plaintext. No labels ("Summary:", "Translation:"), no preamble, and no markdown formatting.
+6. INTEGRITY: Never hallucinate or omit clinical details. No commentary or reasoning.
 """
 
 
-USER_TEMPLATE = """Transform the following single field.
+USER_TEMPLATE = """Process this {field_type} field into clinical plaintext:
 
-Field type: {field_type}
-
-Text:
 {text}
 """
 
