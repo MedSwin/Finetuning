@@ -136,22 +136,48 @@ def load_model(path, bf16_ok=True):
     return tok, model
 
 
+def _content_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [_content_to_text(x) for x in value]
+        return "\n".join([p for p in parts if norm_text(p)])
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        if "content" in value:
+            return _content_to_text(value["content"])
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def extract_reference(obj: Dict[str, Any]) -> Optional[str]:
     """Pick one canonical reference so metrics match MedQuAD's single-ref flow."""
     ideal = obj.get("ideal_completions_data") or {}
 
-    primary = norm_text(ideal.get("ideal_completion"))
+    # 1) Primary ideal completion
+    primary = norm_text(_content_to_text(ideal.get("ideal_completion")))
     if primary:
         return primary
 
+    # 2) First usable reference completion
     for x in ideal.get("ideal_completions_ref_completions") or []:
-        x = norm_text(x)
+        x = norm_text(_content_to_text(x))
         if x:
             return x
 
-    # Optional support if the processed file already exposes a flattened answer/ref.
-    for key in ["answer", "reference", "gold", "gold_answer", "ideal_completion"]:
-        val = norm_text(obj.get(key))
+    # 3) Flat fallbacks for mixed processed/unprocessed exports
+    for key in [
+        "processed_ideal_completion_en_plaintext",
+        "ideal_completion",
+        "answer",
+        "reference",
+        "gold",
+        "gold_answer",
+    ]:
+        val = norm_text(_content_to_text(obj.get(key)))
         if val:
             return val
 
@@ -159,16 +185,48 @@ def extract_reference(obj: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_messages(obj: Dict[str, Any]) -> List[Dict[str, str]]:
-    msgs = obj.get("prompt") or obj.get("messages") or []
-    cleaned = []
-    for m in msgs:
-        if not isinstance(m, dict):
+    candidates = [
+        obj.get("prompt"),
+        obj.get("messages"),
+        obj.get("processed_prompt_en_plaintext"),
+        obj.get("prompt_text"),
+    ]
+
+    for raw in candidates:
+        cleaned: List[Dict[str, str]] = []
+
+        if raw is None:
             continue
-        role = str(m.get("role", "user")).strip().lower() or "user"
-        content = norm_text(m.get("content", ""))
-        if content:
-            cleaned.append({"role": role, "content": content})
-    return cleaned
+
+        if isinstance(raw, str):
+            text = norm_text(raw)
+            if text:
+                return [{"role": "user", "content": text}]
+            continue
+
+        if isinstance(raw, dict):
+            role = str(raw.get("role", "user")).strip().lower() or "user"
+            content = norm_text(_content_to_text(raw.get("content", raw)))
+            if content:
+                return [{"role": role, "content": content}]
+            continue
+
+        if isinstance(raw, list):
+            for m in raw:
+                if isinstance(m, dict):
+                    role = str(m.get("role", "user")).strip().lower() or "user"
+                    content = norm_text(_content_to_text(m.get("content", "")))
+                    if content:
+                        cleaned.append({"role": role, "content": content})
+                else:
+                    content = norm_text(_content_to_text(m))
+                    if content:
+                        cleaned.append({"role": "user", "content": content})
+
+            if cleaned:
+                return cleaned
+
+    return []
 
 
 def convo_to_plaintext(messages: List[Dict[str, str]]) -> str:
@@ -253,14 +311,16 @@ def load_healthbench_rows(path: str, max_samples: int, seed: int):
             line = line.strip()
             if not line:
                 continue
+
             obj = json.loads(line)
 
             ref = extract_reference(obj)
+            messages = extract_messages(obj)
+
             if not ref:
                 skipped_no_ref += 1
                 continue
 
-            messages = extract_messages(obj)
             if not messages:
                 skipped_no_prompt += 1
                 continue
@@ -278,6 +338,12 @@ def load_healthbench_rows(path: str, max_samples: int, seed: int):
     random.shuffle(rows)
     if max_samples and max_samples > 0 and max_samples < len(rows):
         rows = rows[:max_samples]
+
+    print(
+        f"[loader] usable={len(rows)} "
+        f"skipped_no_ref={skipped_no_ref} "
+        f"skipped_no_prompt={skipped_no_prompt}"
+    )
 
     return rows, skipped_no_ref, skipped_no_prompt
 
