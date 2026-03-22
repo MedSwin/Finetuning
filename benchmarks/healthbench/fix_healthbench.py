@@ -7,6 +7,7 @@ Modes:
 - fix: audit an existing processed JSONL, detect rows that are still unsuitable,
        and re-distill only the affected fields.
 
+FIX
 python fix_healthbench.py \
   --mode fix \
   --input healthbench_processed.jsonl \
@@ -16,6 +17,18 @@ python fix_healthbench.py \
   --cache healthbench_cache.jsonl \
   --llm-log healthbench_fix_llm_logs.jsonl \
   --deployment gpt-5-nano \
+  --workers 10 \
+  --overwrite
+
+PROCESS
+python fix_healthbench.py \
+  --mode preprocess \
+  --input healthbench.jsonl \
+  --output healthbench_processed.jsonl \
+  --cache healthbench_cache.jsonl \
+  --llm-log healthbench_preprocess_llm_logs.jsonl \
+  --deployment gpt-5-nano \
+  --workers 10 \
   --overwrite
 
 The fix mode is designed for datasets that are already structurally close to
@@ -31,8 +44,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -40,6 +55,7 @@ from tqdm import tqdm
 API_VERSION = "2024-12-01-preview"
 DEFAULT_DEPLOYMENT = "gpt-5-nano"
 DEFAULT_CHECKPOINT_INTERVAL = 10
+DEFAULT_WORKERS = 10
 
 
 SYSTEM_PROMPT = """You are a medical data extraction and translation engine.
@@ -164,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         help="Rows to buffer before appending to output.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Number of parallel worker threads for LLM-backed processing.",
+    )
+    parser.add_argument(
         "--audit-report",
         default=None,
         help="Optional JSON path to save audit summary in fix mode.",
@@ -285,6 +307,7 @@ class JsonlCache:
     def __init__(self, path: Optional[str]):
         self.path = path
         self.data: Dict[str, str] = {}
+        self._lock = threading.Lock()
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -298,13 +321,15 @@ class JsonlCache:
                         continue
 
     def get(self, key: str) -> Optional[str]:
-        return self.data.get(key)
+        with self._lock:
+            return self.data.get(key)
 
     def set(self, key: str, value: str) -> None:
-        self.data[key] = value
-        if self.path:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
+        with self._lock:
+            self.data[key] = value
+            if self.path:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
 
 
 class AzureFieldProcessor:
@@ -319,6 +344,7 @@ class AzureFieldProcessor:
         retry_sleep: float,
         cache: Optional[JsonlCache] = None,
         log_path: Optional[str] = None,
+        log_lock: Optional[threading.Lock] = None,
     ) -> None:
         self.client = client
         self.deployment = deployment
@@ -329,12 +355,14 @@ class AzureFieldProcessor:
         self.retry_sleep = retry_sleep
         self.cache = cache or JsonlCache(None)
         self.log_path = log_path
+        self.log_lock = log_lock or threading.Lock()
 
     def _append_log(self, payload: Dict[str, Any]) -> None:
         if not self.log_path:
             return
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        with self.log_lock:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def process_field(self, field_type: str, text: str) -> str:
         text = normalize_whitespace(text)
@@ -764,56 +792,124 @@ def load_record_map_by_prompt_id(path: Optional[str]) -> Dict[str, Dict[str, Any
     return mapping
 
 
+class ProcessorFactory:
+    def __init__(self, args: argparse.Namespace, cache: Optional[JsonlCache] = None):
+        self.args = args
+        self.cache = cache or JsonlCache(args.cache)
+        self.log_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    def get(self) -> AzureFieldProcessor:
+        processor = getattr(self._thread_local, "processor", None)
+        if processor is None:
+            client, _ = build_client_if_needed(self.args, needs_llm=True)
+            processor = AzureFieldProcessor(
+                client=client,
+                deployment=self.args.deployment,
+                min_words=self.args.min_output_words,
+                max_words=self.args.max_output_words,
+                max_completion_tokens=self.args.max_completion_tokens,
+                max_retries=self.args.max_retries,
+                retry_sleep=self.args.retry_sleep,
+                cache=self.cache,
+                log_path=self.args.llm_log,
+                log_lock=self.log_lock,
+            )
+            self._thread_local.processor = processor
+        return processor
+
+
+def preprocess_task(task: Tuple[int, str, Dict[str, Any]], factory: ProcessorFactory, replace_original_fields: bool) -> Dict[str, Any]:
+    idx, prompt_id, record = task
+    try:
+        processed = process_record(
+            record=record,
+            processor=factory.get(),
+            replace_original_fields=replace_original_fields,
+        )
+        return {"ok": True, "idx": idx, "prompt_id": prompt_id, "record": processed}
+    except Exception as e:
+        return {"ok": False, "idx": idx, "prompt_id": prompt_id, "error": str(e).split("\n")[0]}
+
+
+def fix_task(
+    task: Tuple[int, str, Dict[str, Any], Dict[str, Any], Dict[str, Any]],
+    factory: ProcessorFactory,
+    max_words: int,
+) -> Dict[str, Any]:
+    idx, prompt_id, record, audit_before, source_record = task
+    try:
+        processor = factory.get()
+        out = deepcopy(record)
+        prompt_fixed, ideal_fixed = False, False
+
+        if audit_before["fix_prompt"]:
+            prompt_raw = prompt_to_plaintext(source_record.get("prompt") or record.get("prompt"))
+            prompt_clean = processor.process_field("prompt", prompt_raw)
+            out["prompt"] = [{"role": "user", "content": prompt_clean}]
+            out.pop("processed_prompt_en_plaintext", None)
+            prompt_fixed = True
+
+        if audit_before["fix_ideal"]:
+            ideal_raw = get_ideal_completion(source_record) or get_ideal_completion(record)
+            ideal_clean = processor.process_field("ideal_completion", ideal_raw)
+            set_ideal_completion(out, ideal_clean)
+            out.pop("processed_ideal_completion_en_plaintext", None)
+            ideal_fixed = True
+
+        audit_after = audit_record(out, max_words=max_words)
+        update_fix_metadata(out, audit_before, audit_after, processor, prompt_fixed, ideal_fixed)
+        return {
+            "ok": True,
+            "idx": idx,
+            "prompt_id": prompt_id,
+            "record": out,
+            "audit_before": audit_before,
+            "audit_after": audit_after,
+        }
+    except Exception as e:
+        return {"ok": False, "idx": idx, "prompt_id": prompt_id, "error": str(e).split("\n")[0], "audit_before": audit_before}
+
+
 def run_preprocess_mode(args: argparse.Namespace) -> int:
     if os.path.exists(args.output) and not args.overwrite and not args.skip_rebuild:
         print(f"Output already exists: {args.output}. Use --overwrite or --skip-rebuild.", file=sys.stderr)
         return 2
 
-    client, _ = build_client_if_needed(args, needs_llm=True)
-    cache = JsonlCache(args.cache)
-    processor = AzureFieldProcessor(
-        client=client,
-        deployment=args.deployment,
-        min_words=args.min_output_words,
-        max_words=args.max_output_words,
-        max_completion_tokens=args.max_completion_tokens,
-        max_retries=args.max_retries,
-        retry_sleep=args.retry_sleep,
-        cache=cache,
-        log_path=args.llm_log,
-    )
-
     existing_ids = load_existing_ids(args.output) if os.path.exists(args.output) else set()
     total_records = sum(1 for _ in open(args.input, "r", encoding="utf-8"))
+    tasks: List[Tuple[int, str, Dict[str, Any]]] = []
+
+    for idx, record in enumerate(iter_jsonl(args.input), start=1):
+        prompt_id = record.get("prompt_id", f"row_{idx}")
+        if prompt_id in existing_ids:
+            continue
+        tasks.append((idx, prompt_id, record))
 
     total_new_processed = 0
     skipped_records: List[Dict[str, str]] = []
     checkpoint_buffer: List[Dict[str, Any]] = []
+    factory = ProcessorFactory(args=args, cache=JsonlCache(args.cache))
 
     try:
         with tqdm(total=total_records, desc="Processing HealthBench", unit="row") as pbar:
-            for idx, record in enumerate(iter_jsonl(args.input), start=1):
-                prompt_id = record.get("prompt_id", f"row_{idx}")
-                if prompt_id in existing_ids:
-                    pbar.update(1)
-                    continue
-                try:
-                    processed = process_record(
-                        record=record,
-                        processor=processor,
-                        replace_original_fields=args.replace_original_fields,
-                    )
-                    checkpoint_buffer.append(processed)
-                    total_new_processed += 1
-                    if len(checkpoint_buffer) >= args.checkpoint_interval:
-                        write_jsonl(args.output, checkpoint_buffer, mode="a")
-                        checkpoint_buffer = []
+            pbar.update(len(existing_ids))
+            with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+                for result in executor.map(
+                    lambda task: preprocess_task(task, factory, args.replace_original_fields),
+                    tasks,
+                ):
+                    if result["ok"]:
+                        checkpoint_buffer.append(result["record"])
+                        total_new_processed += 1
+                        if len(checkpoint_buffer) >= args.checkpoint_interval:
+                            write_jsonl(args.output, checkpoint_buffer, mode="a")
+                            checkpoint_buffer = []
+                    else:
+                        tqdm.write(f"Skipping {result['prompt_id']} due to error: {result['error']}")
+                        skipped_records.append({"id": result["prompt_id"], "error": result["error"]})
+
                     pbar.set_postfix({"new": total_new_processed, "err": len(skipped_records)})
-                    pbar.update(1)
-                except Exception as e:
-                    error_msg = str(e).split("\n")[0]
-                    tqdm.write(f"Skipping {prompt_id} due to error: {error_msg}")
-                    skipped_records.append({"id": prompt_id, "error": error_msg})
                     pbar.update(1)
     except KeyboardInterrupt:
         print("\n[!] Interrupted. Saving progress...", file=sys.stderr)
@@ -826,6 +922,7 @@ def run_preprocess_mode(args: argparse.Namespace) -> int:
     print("Run Complete.")
     print(f" - New rows added: {total_new_processed}")
     print(f" - Skipped (errors): {len(skipped_records)}")
+    print(f" - Workers: {max(1, args.workers)}")
     print(f" - Output file: {args.output}")
     print("-" * 30)
     return 0
@@ -838,91 +935,67 @@ def run_fix_mode(args: argparse.Namespace) -> int:
 
     original_map = load_record_map_by_prompt_id(args.original_input)
     existing_ids = load_existing_ids(args.output) if os.path.exists(args.output) else set()
-    
-    # Setup LLM Processor
-    client, _ = build_client_if_needed(args, needs_llm=not args.dry_run)
-    processor = AzureFieldProcessor(
-        client=client, deployment=args.deployment,
-        min_words=args.min_output_words, max_words=args.max_output_words,
-        max_completion_tokens=args.max_completion_tokens,
-        max_retries=args.max_retries, retry_sleep=args.retry_sleep,
-        cache=JsonlCache(args.cache), log_path=args.llm_log,
-    )
 
-    checkpoint_buffer, output_rows, errors, all_before_audits = [], [], [], []
-    repaired, skipped_clean, total_seen = 0, 0, 0
+    output_rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    all_before_audits: List[Dict[str, Any]] = []
+    tasks: List[Tuple[int, str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
+    repaired = 0
+    skipped_clean = 0
+    total_seen = 0
 
-    try:
-        # We use a simple progress bar without pre-counting the whole file for speed
-        with tqdm(desc="Fixing HealthBench", unit="row") as pbar:
-            for idx, record in enumerate(iter_jsonl(args.input), start=1):
-                total_seen += 1
-                prompt_id = record.get("prompt_id", f"row_{idx}")
-                if prompt_id in existing_ids:
-                    pbar.update(1)
-                    continue
+    for idx, record in enumerate(iter_jsonl(args.input), start=1):
+        total_seen += 1
+        prompt_id = record.get("prompt_id", f"row_{idx}")
+        if prompt_id in existing_ids:
+            continue
 
-                # Detect directly if fix is needed
-                audit_before = audit_record(record, max_words=args.max_output_words)
-                all_before_audits.append(audit_before)
+        audit_before = audit_record(record, max_words=args.max_output_words)
+        all_before_audits.append(audit_before)
 
-                if not audit_before["needs_fix"]:
-                    skipped_clean += 1
-                    pbar.update(1)
-                    continue 
+        if not audit_before["needs_fix"]:
+            skipped_clean += 1
+            continue
 
-                if args.dry_run:
-                    repaired += 1
-                    pbar.update(1)
-                    continue
+        if args.fix_max_rows > 0 and len(tasks) >= args.fix_max_rows:
+            continue
 
-                if args.fix_max_rows > 0 and repaired >= args.fix_max_rows:
-                    break
+        source_record = original_map.get(prompt_id, record)
+        tasks.append((idx, prompt_id, record, audit_before, source_record))
 
-                try:
-                    out = deepcopy(record)
-                    source_record = original_map.get(prompt_id, record)
-                    prompt_fixed, ideal_fixed = False, False
+    if args.dry_run:
+        repaired = len(tasks)
+    else:
+        checkpoint_buffer: List[Dict[str, Any]] = []
+        factory = ProcessorFactory(args=args, cache=JsonlCache(args.cache))
+        try:
+            with tqdm(total=total_seen, desc="Fixing HealthBench", unit="row") as pbar:
+                pbar.update(len(existing_ids) + skipped_clean)
+                with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+                    for result in executor.map(
+                        lambda task: fix_task(task, factory, args.max_output_words),
+                        tasks,
+                    ):
+                        if result["ok"]:
+                            checkpoint_buffer.append(result["record"])
+                            output_rows.append(result["record"])
+                            repaired += 1
+                            if len(checkpoint_buffer) >= args.checkpoint_interval:
+                                write_jsonl(args.output, checkpoint_buffer, mode="a")
+                                checkpoint_buffer = []
+                        else:
+                            errors.append({"id": result["prompt_id"], "error": result["error"]})
 
-                    if audit_before["fix_prompt"]:
-                        prompt_raw = prompt_to_plaintext(source_record.get("prompt") or record.get("prompt"))
-                        prompt_clean = processor.process_field("prompt", prompt_raw)
-                        out["prompt"] = [{"role": "user", "content": prompt_clean}]
-                        out.pop("processed_prompt_en_plaintext", None)
-                        prompt_fixed = True
-
-                    if audit_before["fix_ideal"]:
-                        ideal_raw = get_ideal_completion(source_record) or get_ideal_completion(record)
-                        ideal_clean = processor.process_field("ideal_completion", ideal_raw)
-                        set_ideal_completion(out, ideal_clean)
-                        out.pop("processed_ideal_completion_en_plaintext", None)
-                        ideal_fixed = True
-
-                    audit_after = audit_record(out, max_words=args.max_output_words)
-                    update_fix_metadata(out, audit_before, audit_after, processor, prompt_fixed, ideal_fixed)
-                    
-                    checkpoint_buffer.append(out)
-                    repaired += 1
-                    if len(checkpoint_buffer) >= args.checkpoint_interval:
-                        write_jsonl(args.output, checkpoint_buffer, mode="a")
-                        output_rows.extend(checkpoint_buffer)
-                        checkpoint_buffer = []
-                    
-                    pbar.set_postfix({"repaired": repaired, "skipped": skipped_clean, "err": len(errors)})
-                    pbar.update(1)
-                except Exception as e:
-                    errors.append({"id": prompt_id, "error": str(e).split("\n")[0]})
-                    pbar.update(1)
-                    
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted.", file=sys.stderr)
-    finally:
-        if checkpoint_buffer:
-            write_jsonl(args.output, checkpoint_buffer, mode="a")
-            output_rows.extend(checkpoint_buffer)
-
+                        pbar.set_postfix({"repaired": repaired, "skipped": skipped_clean, "err": len(errors)})
+                        pbar.update(1)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted.", file=sys.stderr)
+        finally:
+            if checkpoint_buffer:
+                write_jsonl(args.output, checkpoint_buffer, mode="a")
     summary_before = build_audit_summary(all_before_audits, total_rows=total_seen)
-    summary_after = build_audit_summary([audit_record(r, args.max_output_words) for r in output_rows], len(output_rows))
+    summary_after_input = output_rows if output_rows else []
+    summary_after = build_audit_summary([audit_record(r, args.max_output_words) for r in summary_after_input], len(summary_after_input))
 
     final_report = {
         "mode": "fix",
@@ -930,7 +1003,8 @@ def run_fix_mode(args: argparse.Namespace) -> int:
             "total_input_scanned": total_seen,
             "repaired_count": repaired,
             "skipped_clean_count": skipped_clean,
-            "error_count": len(errors)
+            "error_count": len(errors),
+            "workers": max(1, args.workers),
         },
         "audit_before": summary_before,
         "audit_after": summary_after,
