@@ -58,9 +58,17 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 torch.set_float32_matmul_precision("high")
 
 SYS_MSG = (
-    "You are a careful medical exam assistant. "
-    "You must answer using only option letter(s). "
-    "Never explain your reasoning. Never write full words unless they are already encoded as option letters."
+    "You are taking a medical multiple-choice exam.\n"
+    "Your reply must follow these strict rules:\n"
+    "1) The FIRST non-space characters of your reply must be exactly: ANSWER: \n"
+    "2) After 'ANSWER: ' output only the answer option letter(s).\n"
+    "3) Single-answer questions: output exactly one lowercase letter: a or b or c or d.\n"
+    "4) Multi-answer questions: output lowercase letters only, sorted alphabetically, comma-separated.\n"
+    "5) Do NOT output any explanation, reasoning, words, sentences, bullets, or extra punctuation.\n"
+    "6) Do NOT restate the question. Do NOT write the option text.\n"
+    "Examples:\n"
+    "ANSWER: c\n"
+    "ANSWER: a,c"
 )
 
 DEFAULT_MODEL_NAMES = [
@@ -170,15 +178,24 @@ def build_user_prompt(row: Dict[str, Any]) -> str:
     if row["choice_type"] == "single":
         task = (
             "Task: choose the single best answer.\n"
-            "Output format: exactly one lowercase letter: a or b or c or d.\n"
-            "Return only the letter."
+            "Output format: ANSWER: c\n"
+            "Return exactly one lowercase letter only after 'ANSWER: '.\n"
+            "Wrong examples:\n"
+            "- c\n"
+            "- The answer is c\n"
+            "- ANSWER: Selenium\n"
+            "- ANSWER: c because ..."
         )
     else:
         task = (
             "Task: choose all correct answers.\n"
-            "Output format: lowercase letters only, sorted alphabetically, separated by commas.\n"
-            "Valid examples: a,c   b,d   a,b,c\n"
-            "Return only the letters."
+            "Output format: ANSWER: a,c\n"
+            "Return lowercase letters only after 'ANSWER: ', sorted alphabetically and separated by commas.\n"
+            "Wrong examples:\n"
+            "- a,c\n"
+            "- The answers are a and c\n"
+            "- ANSWER: Selenium, Chromium\n"
+            "- ANSWER: a,c because ..."
         )
 
     return (
@@ -189,7 +206,7 @@ def build_user_prompt(row: Dict[str, Any]) -> str:
         f"c. {c}\n"
         f"d. {d}\n\n"
         f"{task}\n\n"
-        f"Answer:"
+        f"Important: start your reply immediately with 'ANSWER: '."
     )
 
 
@@ -295,54 +312,200 @@ def generate_batch(tok, model, prompts: List[str], max_new_tokens: int = 8) -> L
     return preds
 
 
-def _extract_answer_segment(text: str) -> str:
-    t = norm_text(text)
-    if not t:
-        return ""
-
-    lower = t.lower()
-    m = re.search(r"(?:^|\b)(?:final answer|answer|ans)\s*[:\-]?\s*(.+)$", lower)
-    if m:
-        seg = m.group(1).strip()
-        if seg:
-            return seg
-
-    first_line = t.splitlines()[0].strip() if "\n" in t else t.strip()
-    if first_line:
-        return first_line
-    return t
-
-
-def _extract_letters_strict(segment: str) -> Optional[List[str]]:
-    s = norm_text(segment).lower()
-    if not s:
-        return None
-
-    s = s.replace("/", ",").replace(";", ",").replace("|", ",")
-    s = re.sub(r"\band\b", ",", s)
-    s = re.sub(r"\s+", " ", s).strip()
+def _clean_generation_text(text: str) -> str:
+    t = str(text or "")
 
     patterns = [
-        r"^(?:option\s+)?([abcd](?:\s*,\s*[abcd])*)$",
-        r"^([abcd](?:\s*[,&/]\s*[abcd])*)$",
-        r"^\(?([abcd])\)?$",
+        r"<unk>",
+        r"<pad>",
+        r"<s>",
+        r"</s>",
+        r"<bos>",
+        r"</bos>",
+        r"<eos>",
+        r"</eos>",
+        r"<\|endoftext\|>",
+        r"<\|assistant\|>",
+        r"<\|user\|>",
+        r"<\|system\|>",
+        r"<\|im_start\|>",
+        r"<\|im_end\|>",
+        r"\[INST\]",
+        r"\[/INST\]",
+        r"<<SYS>>",
+        r"<</SYS>>",
     ]
     for pat in patterns:
-        m = re.match(pat, s)
-        if m:
-            letters = re.findall(r"[abcd]", m.group(1))
-            return uniq_sorted_letters(letters)
+        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
 
-    m = re.match(r"^(?:option\s+)?([1-4](?:\s*,\s*[1-4])*)$", s)
-    if m:
-        digits = re.findall(r"[1-4]", m.group(1))
-        return uniq_sorted_letters([LETTER_BY_INDEX[int(d)] for d in digits])
+    t = re.sub(r"<[^>\n]{1,40}>", " ", t)
 
-    m = re.match(r"^(?:option\s+)?([1-4])$", s)
-    if m:
-        return [LETTER_BY_INDEX[int(m.group(1))]]
+    t = (
+        t.replace("\u200b", " ")
+         .replace("\u200c", " ")
+         .replace("\u200d", " ")
+         .replace("\ufeff", " ")
+         .replace("\xa0", " ")
+         .replace("\r\n", "\n")
+         .replace("\r", "\n")
+    )
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n[ \t]+", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
+
+def _normalise_candidate_text(text: str) -> str:
+    s = _clean_generation_text(text).lower()
+    s = s.replace("(", " ").replace(")", " ")
+    s = s.replace("[", " ").replace("]", " ")
+    s = s.replace("{", " ").replace("}", " ")
+    s = s.replace("/", ",").replace(";", ",").replace("|", ",")
+    s = re.sub(r"\b(?:and|or)\b", ",", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+ANSWER_CUE_RE = re.compile(
+    r"(?:^|\n|\b)"
+    r"(?:final answer|correct answer|correct option(?:s)?|selected answer|"
+    r"selected option(?:s)?|best answer|answer|ans)\s*"
+    r"(?:is|are|=|:|-)?\s*(.+)",
+    flags=re.IGNORECASE,
+)
+
+LEADING_SEQ_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?:the\s+)?(?:correct\s+|best\s+|final\s+)?(?:answer|option|choice)s?\s*
+        (?:is|are|=|:|-)?\s*
+    )?
+    (?P<body>
+        (?:option|choice)?\s*[\(\[\{]?\s*[abcd1-4]\s*[\)\]\}]?
+        (?:\s*(?:,|/|&|\band\b|\bor\b)\s*(?:option|choice)?\s*[\(\[\{]?\s*[abcd1-4]\s*[\)\]\}]?){0,3}
+    )
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in _clean_generation_text(text).splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _first_sentence(text: str) -> str:
+    cleaned = _clean_generation_text(text)
+    if not cleaned:
+        return ""
+    return re.split(r"[.!?\n]", cleaned, maxsplit=1)[0].strip()
+
+
+def _convert_token_to_letter(tok: str) -> Optional[str]:
+    tok = tok.strip().lower()
+    if tok in VALID_LETTER_SET:
+        return tok
+    if tok in {"1", "2", "3", "4"}:
+        return LETTER_BY_INDEX[int(tok)]
     return None
+
+
+def _dedupe_keep_order(xs: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _extract_sequence_tokens(seq: str) -> List[str]:
+    found = []
+    token_pat = re.compile(
+        r"(?:option|choice)?\s*[\(\[\{]?\s*([abcd1-4])\s*[\)\]\}]?",
+        flags=re.IGNORECASE,
+    )
+    for m in token_pat.finditer(seq):
+        letter = _convert_token_to_letter(m.group(1))
+        if letter:
+            found.append(letter)
+    return _dedupe_keep_order(found)
+
+
+def _looks_answer_like(text: str) -> bool:
+    s = norm_text(text).lower()
+    if not s:
+        return False
+
+    if re.match(r"^(?:answer|ans|final answer|correct answer|best answer|selected answer)\b", s):
+        return True
+
+    if re.match(r"^(?:option|choice)\s*[abcd1-4]\b", s):
+        return True
+
+    if re.match(
+        r"^[\(\[\{]?\s*[abcd1-4]\s*[\)\]\}]?"
+        r"(?:\s*(?:,|/|&|\band\b|\bor\b)\s*[\(\[\{]?\s*[abcd1-4]\s*[\)\]\}]?){0,3}"
+        r"\s*[.;,:-]?\s*$",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _extract_cue_tails(text: str) -> List[str]:
+    cleaned = _clean_generation_text(text)
+    if not cleaned:
+        return []
+
+    out = []
+    seen = set()
+
+    for m in ANSWER_CUE_RE.finditer(cleaned):
+        tail = m.group(1).strip()
+        if not tail:
+            continue
+        # keep only the first line / first clause after the cue
+        tail = re.split(r"[\n]", tail, maxsplit=1)[0].strip()
+        key = tail.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(tail)
+
+    return out
+
+
+def _extract_answer_by_pattern(segment: str) -> Tuple[List[str], str]:
+    s = _clean_generation_text(segment)
+    if not s:
+        return [], "empty"
+
+    m = LEADING_SEQ_RE.match(s)
+    if m:
+        letters = uniq_sorted_letters(_extract_sequence_tokens(m.group("body")))
+        if letters:
+            return letters, "leading_sequence"
+
+    # Explicit "option c" / "choice b" / "(d)" / "c."
+    pats = [
+        r"^\s*(?:option|choice)\s*([abcd1-4])\b",
+        r"^\s*[\(\[\{]?\s*([abcd1-4])\s*[\)\]\}]?\s*[.;,:-]?\s*$",
+    ]
+    for pat in pats:
+        m = re.match(pat, s, flags=re.IGNORECASE)
+        if m:
+            letter = _convert_token_to_letter(m.group(1))
+            if letter:
+                return [letter], "single_token"
+
+    return [], "unparsed"
 
 
 def _map_text_to_options(segment: str, option_map: Dict[str, str]) -> Tuple[List[str], str]:
@@ -350,43 +513,132 @@ def _map_text_to_options(segment: str, option_map: Dict[str, str]) -> Tuple[List
     if not tnorm:
         return [], "empty"
 
+    tpad = f" {tnorm} "
+    seg_tokens = set(tnorm.split())
+
     exact = []
     contained = []
+    fuzzy = []
+
     for letter, opt_text in option_map.items():
         onorm = normalize_option_text(opt_text)
         if not onorm:
             continue
+
+        opad = f" {onorm} "
+        otoks = set(onorm.split())
+
         if tnorm == onorm:
             exact.append(letter)
-        elif onorm in tnorm:
+            continue
+
+        if opad in tpad:
             contained.append(letter)
+            continue
+
+        inter = len(seg_tokens & otoks)
+        recall = inter / max(1, len(otoks))
+        precision = inter / max(1, len(seg_tokens))
+
+        # Conservative fuzzy fallback:
+        # - one-word option: token must appear exactly
+        # - multi-word option: substantial overlap
+        if len(otoks) == 1 and inter == 1:
+            fuzzy.append((letter, 1.0, precision, len(otoks)))
+        elif inter >= 2 and recall >= 0.75 and precision >= 0.34:
+            fuzzy.append((letter, recall, precision, len(otoks)))
 
     if exact:
         return uniq_sorted_letters(exact), "option_text_exact"
-    if len(contained) == 1:
+    if contained:
         return uniq_sorted_letters(contained), "option_text_contained"
+    if fuzzy:
+        fuzzy = sorted(fuzzy, key=lambda x: (-x[1], -x[2], x[3], x[0]))
+        return uniq_sorted_letters([x[0] for x in fuzzy]), "option_text_fuzzy"
+
     return [], "unparsed"
 
 
 def parse_prediction(raw_text: str, option_map: Dict[str, str], choice_type: str) -> Tuple[List[str], bool, str]:
-    segment = _extract_answer_segment(raw_text)
-    strict_letters = _extract_letters_strict(segment)
-    if strict_letters is not None:
-        if choice_type == "single":
-            valid = len(strict_letters) == 1
-            return strict_letters[:1], valid, "strict_letters"
-        valid = len(strict_letters) >= 1
-        return uniq_sorted_letters(strict_letters), valid, "strict_letters"
+    cleaned = _clean_generation_text(raw_text)
+    if not cleaned:
+        return [], False, "empty"
 
-    mapped, source = _map_text_to_options(segment, option_map)
-    if mapped:
-        if choice_type == "single":
-            valid = len(mapped) == 1
-            return mapped[:1], valid, source
-        valid = len(mapped) >= 1
-        return uniq_sorted_letters(mapped), valid, source
+    first_line = _first_nonempty_line(cleaned)
+    first_sentence = _first_sentence(cleaned)
+    cue_tails = _extract_cue_tails(cleaned)
 
-    return [], False, source
+    # Pass 1: high-confidence letter parsing from answer-cue tails first
+    anchored_letter_candidates = []
+    anchored_letter_candidates.extend(cue_tails)
+    if _looks_answer_like(first_line):
+        anchored_letter_candidates.append(first_line)
+    if _looks_answer_like(first_sentence):
+        anchored_letter_candidates.append(first_sentence)
+
+    anchored_letter_candidates = _dedupe_keep_order(anchored_letter_candidates)
+
+    for seg in anchored_letter_candidates:
+        letters, source = _extract_answer_by_pattern(seg)
+        if not letters:
+            continue
+
+        letters = uniq_sorted_letters(letters)
+
+        if choice_type == "single":
+            if len(letters) == 1:
+                return [letters[0]], True, source
+            if len(letters) > 1:
+                return [], False, "multiple_letters_single"
+            continue
+
+        if len(letters) >= 1:
+            return letters, True, source
+
+    # Pass 2: option-text mapping fallback
+    text_candidates = []
+    text_candidates.extend(cue_tails)
+    if first_line:
+        text_candidates.append(first_line)
+    if first_sentence:
+        text_candidates.append(first_sentence)
+    text_candidates.append(cleaned[:120])
+
+    text_candidates = _dedupe_keep_order([x for x in text_candidates if x.strip()])
+
+    for seg in text_candidates:
+        mapped, source = _map_text_to_options(seg, option_map)
+        if not mapped:
+            continue
+
+        mapped = uniq_sorted_letters(mapped)
+
+        if choice_type == "single":
+            if len(mapped) == 1 and source in {"option_text_exact", "option_text_contained", "option_text_fuzzy"}:
+                return [mapped[0]], True, source
+            if len(mapped) > 1:
+                continue
+        else:
+            if len(mapped) >= 1:
+                return mapped, True, source
+
+    # Pass 3: final conservative fallback
+    # Only inspect the first line, never the whole output, to avoid false positives
+    if first_line:
+        compact = _normalise_candidate_text(first_line)
+        m = re.match(
+            r"^(?:answer\s*:?\s*)?((?:[abcd1-4])(?:\s*(?:,|/|&)\s*[abcd1-4]){0,3})$",
+            compact,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            letters = uniq_sorted_letters(_extract_sequence_tokens(m.group(1)))
+            if choice_type == "single" and len(letters) == 1:
+                return [letters[0]], True, "first_line_compact_fallback"
+            if choice_type == "multi" and len(letters) >= 1:
+                return letters, True, "first_line_compact_fallback"
+
+    return [], False, "unparsed"
 
 
 def safe_mean(series: pd.Series) -> float:
@@ -440,7 +692,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=5000, help="Cap for speed; set 0 or negative for full dataset")
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--max-new-tokens", type=int, default=8)
+    ap.add_argument("--max-new-tokens", type=int, default=6)
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -545,7 +797,8 @@ def main():
                     "opd": row["opd"],
                     "gold_letters": ",".join(row["gold_letters"]),
                     "gold_texts": " | ".join(row["gold_texts"]),
-                    "pred_raw": norm_text(raw_pred),
+                    "pred_raw": str(raw_pred or ""),
+                    "pred_raw_norm": norm_text(raw_pred),
                     "pred_letters": ",".join(pred_letters),
                     "pred_texts": " | ".join(pred_texts),
                     "parse_source": parse_source,
