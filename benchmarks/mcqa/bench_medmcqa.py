@@ -649,6 +649,292 @@ def pct(numer: int, denom: int) -> float:
     return round((100.0 * numer / denom), 4) if denom else 0.0
 
 
+def split_letters_field(x: Any) -> List[str]:
+    if x is None:
+        return []
+    s = str(x).strip().lower()
+    if not s or s == "nan":
+        return []
+    parts = re.split(r"[\s,;/|]+", s)
+    return uniq_sorted_letters(parts)
+
+
+def split_texts_field(x: Any) -> List[str]:
+    if x is None:
+        return []
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return []
+    return [norm_text(p) for p in s.split("|") if norm_text(p)]
+
+
+def _answer_instruction_noise_patterns() -> List[str]:
+    return [
+        r"important\s*:\s*start your reply immediately with\s*['\"]?answer\s*:\s*['\"]?",
+        r"do not restate the question",
+        r"do not write any explanation",
+        r"do not write any extra text",
+        r"return exactly one lowercase letter only after\s*['\"]?answer\s*:\s*['\"]?",
+        r"output format\s*:\s*answer\s*:\s*[a-d](?:,[a-d])?",
+        r"wrong examples\s*:.*",
+        r"task\s*:.*",
+        r"choose the single best answer.*",
+        r"choose all correct answers.*",
+    ]
+
+
+def strip_instruction_noise(text: str) -> str:
+    s = _clean_generation_text(text)
+    if not s:
+        return ""
+    for pat in _answer_instruction_noise_patterns():
+        s = re.sub(pat, " ", s, flags=re.IGNORECASE | re.DOTALL)
+    s = re.sub(r"\b(?:answer|ans)\s*:\s*$", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" \n\t-:;,.")
+    return s
+
+
+def extract_letters_anywhere(text: str) -> List[str]:
+    s = _normalise_candidate_text(text)
+    if not s:
+        return []
+
+    found = []
+
+    # explicit answer cue first
+    for m in re.finditer(
+        r"(?:answer|ans|final answer|correct answer|correct option(?:s)?|best answer|option|choice)\s*(?:is|are|=|:|-)?\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        found.extend(_extract_sequence_tokens(m.group(1)))
+
+    # then any clean standalone sequence anywhere
+    for m in re.finditer(
+        r"(?<![a-z0-9])([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})(?![a-z0-9])",
+        s,
+        flags=re.IGNORECASE,
+    ):
+        found.extend(_extract_sequence_tokens(m.group(1)))
+
+    return uniq_sorted_letters(found)
+
+
+def map_segment_to_best_option(segment: str, option_map: Dict[str, str]) -> List[str]:
+    mapped, source = _map_text_to_options(segment, option_map)
+    if not mapped:
+        return []
+
+    mapped = uniq_sorted_letters(mapped)
+
+    # for single-answer text fragments, pick only the strongest one
+    if len(mapped) <= 1:
+        return mapped
+
+    scores = []
+    seg_norm = normalize_option_text(segment)
+    seg_tokens = set(seg_norm.split())
+
+    for letter in mapped:
+        opt_norm = normalize_option_text(option_map.get(letter, ""))
+        opt_tokens = set(opt_norm.split())
+        inter = len(seg_tokens & opt_tokens)
+        recall = inter / max(1, len(opt_tokens))
+        precision = inter / max(1, len(seg_tokens))
+        scores.append((letter, recall, precision, len(opt_tokens)))
+
+    scores.sort(key=lambda x: (-x[1], -x[2], x[3], x[0]))
+    return [scores[0][0]] if scores else []
+
+
+def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_type: str) -> Tuple[List[str], bool, str]:
+    cleaned = _clean_generation_text(raw_text)
+    if not cleaned:
+        return [], False, "empty"
+
+    first_line = _first_nonempty_line(cleaned)
+    first_sentence = _first_sentence(cleaned)
+    cue_tails = _extract_cue_tails(cleaned)
+    de_noised = strip_instruction_noise(cleaned)
+
+    # Pass 1: anchored parser (keep current strong logic first)
+    letters, is_valid, source = parse_prediction(raw_text, option_map, choice_type)
+    if is_valid and letters:
+        return letters, True, f"strict::{source}"
+
+    # Pass 2: letters anywhere in the useful text, but be careful for single-answer
+    candidate_segments = _dedupe_keep_order(
+        [x for x in [de_noised, first_line, first_sentence, *cue_tails] if norm_text(x)]
+    )
+
+    for seg in candidate_segments:
+        found = extract_letters_anywhere(seg)
+        if not found:
+            continue
+        if choice_type == "single":
+            if len(found) == 1:
+                return found, True, "lenient_letters_anywhere"
+        else:
+            return found, True, "lenient_letters_anywhere"
+
+    # Pass 3: map text fragment to option text more leniently
+    for seg in candidate_segments:
+        mapped, src = _map_text_to_options(seg, option_map)
+        mapped = uniq_sorted_letters(mapped)
+        if not mapped:
+            continue
+
+        if choice_type == "single":
+            best = map_segment_to_best_option(seg, option_map)
+            if len(best) == 1:
+                return best, True, f"lenient_text::{src}"
+        else:
+            return mapped, True, f"lenient_text::{src}"
+
+    # Pass 4: whole cleaned text as final fallback
+    mapped, src = _map_text_to_options(de_noised or cleaned, option_map)
+    mapped = uniq_sorted_letters(mapped)
+    if mapped:
+        if choice_type == "single":
+            best = map_segment_to_best_option(de_noised or cleaned, option_map)
+            if len(best) == 1:
+                return best, True, f"whole_text::{src}"
+        else:
+            return mapped, True, f"whole_text::{src}"
+
+    return [], False, "unparsed"
+
+
+def score_prediction(gold_letters: List[str], pred_letters: List[str], is_valid: bool) -> Tuple[int, str]:
+    gold = uniq_sorted_letters(gold_letters)
+    pred = uniq_sorted_letters(pred_letters)
+
+    if not is_valid or not pred:
+        return 0, "invalid"
+
+    # single-answer: exact letter only
+    if len(gold) == 1:
+        return (1, "correct") if pred[:1] == gold else (0, "incorrect")
+
+    # multi-answer:
+    # lenient rule:
+    # - exact set match => correct
+    # - if gold is contained within prediction => correct
+    # - if prediction is a non-empty subset of gold => correct
+    # This follows your "be lenient" instruction.
+    gold_set = set(gold)
+    pred_set = set(pred)
+
+    if pred_set == gold_set:
+        return 1, "correct"
+    if gold_set.issubset(pred_set):
+        return 1, "correct"
+    if pred_set and pred_set.issubset(gold_set):
+        return 1, "correct"
+
+    return 0, "incorrect"
+
+
+def compute_metrics_from_audit_df(df: pd.DataFrame, model_name: str, model_dir: str, audit_csv: str) -> Dict[str, Any]:
+    if df.empty:
+        return {
+            "model": model_name,
+            "model_dir": model_dir,
+            "n": 0,
+            "correct_count": 0,
+            "incorrect_count": 0,
+            "invalid_count": 0,
+            "accuracy_pct": 0.0,
+            "incorrect_pct": 0.0,
+            "invalid_pct": 0.0,
+            "valid_rate_pct": 0.0,
+            "single_n": 0,
+            "single_correct_count": 0,
+            "single_incorrect_count": 0,
+            "single_invalid_count": 0,
+            "single_accuracy_pct": 0.0,
+            "multi_n": 0,
+            "multi_correct_count": 0,
+            "multi_incorrect_count": 0,
+            "multi_invalid_count": 0,
+            "multi_accuracy_pct": 0.0,
+            "audit_csv": audit_csv,
+        }
+
+    total_n = int(len(df))
+    correct_n = int((df["outcome"] == "correct").sum())
+    incorrect_n = int((df["outcome"] == "incorrect").sum())
+    invalid_n = int((df["outcome"] == "invalid").sum())
+
+    df_single = df[df["choice_type"] == "single"]
+    df_multi = df[df["choice_type"] == "multi"]
+
+    return {
+        "model": model_name,
+        "model_dir": model_dir,
+        "n": total_n,
+        "correct_count": correct_n,
+        "incorrect_count": incorrect_n,
+        "invalid_count": invalid_n,
+        "accuracy_pct": pct(correct_n, total_n),
+        "incorrect_pct": pct(incorrect_n, total_n),
+        "invalid_pct": pct(invalid_n, total_n),
+        "valid_rate_pct": pct(total_n - invalid_n, total_n),
+        "single_n": int(len(df_single)),
+        "single_correct_count": int((df_single["outcome"] == "correct").sum()),
+        "single_incorrect_count": int((df_single["outcome"] == "incorrect").sum()),
+        "single_invalid_count": int((df_single["outcome"] == "invalid").sum()),
+        "single_accuracy_pct": pct(int((df_single["outcome"] == "correct").sum()), int(len(df_single))),
+        "multi_n": int(len(df_multi)),
+        "multi_correct_count": int((df_multi["outcome"] == "correct").sum()),
+        "multi_incorrect_count": int((df_multi["outcome"] == "incorrect").sum()),
+        "multi_invalid_count": int((df_multi["outcome"] == "invalid").sum()),
+        "multi_accuracy_pct": pct(int((df_multi["outcome"] == "correct").sum()), int(len(df_multi))),
+        "audit_csv": audit_csv,
+    }
+
+
+def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in df.iterrows():
+        choice_type = normalize_choice_type(r.get("choice_type"))
+        option_map = {
+            "a": norm_text(r.get("opa")),
+            "b": norm_text(r.get("opb")),
+            "c": norm_text(r.get("opc")),
+            "d": norm_text(r.get("opd")),
+        }
+
+        gold_letters = split_letters_field(r.get("gold_letters"))
+        if not gold_letters:
+            # fallback from gold_texts if needed
+            gt = split_texts_field(r.get("gold_texts"))
+            recovered = []
+            for txt in gt:
+                m, _ = _map_text_to_options(txt, option_map)
+                recovered.extend(m)
+            gold_letters = uniq_sorted_letters(recovered)
+
+        raw_text = str(r.get("pred_raw", "") or "")
+        pred_letters, is_valid, parse_source = parse_prediction_lenient(raw_text, option_map, choice_type)
+        pred_texts = [option_map[x] for x in pred_letters if x in option_map]
+        correct, outcome = score_prediction(gold_letters, pred_letters, is_valid)
+
+        rr = dict(r)
+        rr["gold_letters"] = ",".join(gold_letters)
+        rr["gold_texts"] = " | ".join([option_map[x] for x in gold_letters if x in option_map])
+        rr["pred_raw_norm"] = norm_text(raw_text)
+        rr["pred_letters"] = ",".join(pred_letters)
+        rr["pred_texts"] = " | ".join(pred_texts)
+        rr["parse_source"] = parse_source
+        rr["is_valid"] = int(is_valid)
+        rr["correct"] = int(correct)
+        rr["outcome"] = outcome
+        rows.append(rr)
+
+    return pd.DataFrame(rows)
+
+
 def ensure_model_dirs(args) -> List[str]:
     model_dirs: List[str] = []
     if args.use_default_models:
@@ -683,7 +969,7 @@ def build_run_dir(outdir: str, run_name: Optional[str]) -> Path:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-jsonl", required=True, help="data/medmcqa/medmcqa.jsonl")
+    ap.add_argument("--data-jsonl", default=None, help="data/medmcqa/medmcqa.jsonl; not required in --local-audit mode")
     ap.add_argument("--model-dirs", nargs="+", default=None, help="Explicit model directories")
     ap.add_argument("--use-default-models", action="store_true", help="Benchmark all default model names under --model-root")
     ap.add_argument("--model-root", default="model", help="Root folder containing benchmark model directories")
@@ -693,11 +979,85 @@ def main():
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=6)
+
+    ap.add_argument("--local-audit", action="store_true",
+                    help="Do not run inference. Scan each model folder's audit.csv, re-score leniently, and write result.csv")
+    ap.add_argument("--audit-filename", default="audit.csv",
+                    help="Audit filename to scan inside each model folder in --local-audit mode")
+    ap.add_argument("--rewrite-audit", action="store_true",
+                    help="In --local-audit mode, also write a leniently re-scored audit_lenient.csv for each model")
+
     args = ap.parse_args()
+
+    if not args.local_audit and not args.data_jsonl:
+        ap.error("--data-jsonl is required unless --local-audit is used")
 
     random.seed(args.seed)
     model_dirs = ensure_model_dirs(args)
     run_dir = build_run_dir(args.outdir, args.run_name)
+
+    if args.local_audit:
+        summary_rows = []
+
+        for mpath in model_dirs:
+            mname = Path(mpath).name
+            audit_csv = Path(mpath) / args.audit_filename
+            if not audit_csv.exists():
+                print(f"[warn] missing audit for {mname}: {audit_csv}")
+                continue
+
+            df = pd.read_csv(audit_csv)
+            df_lenient = rerate_audit_df_lenient(df)
+
+            if args.rewrite_audit:
+                df_lenient.to_csv(Path(mpath) / "audit_lenient.csv", index=False, encoding="utf-8")
+
+            metrics = compute_metrics_from_audit_df(
+                df_lenient,
+                model_name=mname,
+                model_dir=mpath,
+                audit_csv=str(audit_csv),
+            )
+            summary_rows.append(metrics)
+
+            print(
+                f"[local-audit] model={mname} "
+                f"accuracy={metrics['accuracy_pct']:.2f}% "
+                f"incorrect={metrics['incorrect_pct']:.2f}% "
+                f"invalid={metrics['invalid_pct']:.2f}%"
+            )
+
+        summary_df = pd.DataFrame(summary_rows)
+        result_csv = run_dir / "result.csv"
+        result_json = run_dir / "result.json"
+
+        if not summary_df.empty:
+            summary_df = summary_df.sort_values(["accuracy_pct", "valid_rate_pct"], ascending=[False, False])
+
+        summary_df.to_csv(result_csv, index=False, encoding="utf-8")
+        with open(result_json, "w", encoding="utf-8") as f:
+            json.dump(summary_rows, f, indent=2, ensure_ascii=False)
+
+        run_config = {
+            "command_args": vars(args),
+            "resolved_model_dirs": model_dirs,
+            "run_dir": str(run_dir),
+            "result_csv": str(result_csv),
+            "result_json": str(result_json),
+            "mode": "local_audit",
+        }
+        with open(run_dir / "run_config.json", "w", encoding="utf-8") as f:
+            json.dump(run_config, f, indent=2, ensure_ascii=False)
+
+        print("\n=== LOCAL AUDIT SUMMARY ===")
+        if not summary_df.empty:
+            print(summary_df[
+                ["model", "n", "correct_count", "incorrect_count", "invalid_count",
+                 "accuracy_pct", "incorrect_pct", "invalid_pct"]
+            ].to_string(index=False))
+        print(f"[saved] {result_csv}")
+        print(f"[saved] {result_json}")
+        return
 
     rows = []
     skipped = 0
@@ -774,16 +1134,9 @@ def main():
                     "c": row["opc"],
                     "d": row["opd"],
                 }
-                pred_letters, is_valid, parse_source = parse_prediction(raw_pred, option_map, row["choice_type"])
+                pred_letters, is_valid, parse_source = parse_prediction_lenient(raw_pred, option_map, row["choice_type"])
                 pred_texts = [option_map[x] for x in pred_letters if x in option_map]
-                exact_match = set(pred_letters) == set(row["gold_letters"])
-
-                if not is_valid:
-                    outcome = "invalid"
-                elif exact_match:
-                    outcome = "correct"
-                else:
-                    outcome = "incorrect"
+                correct, outcome = score_prediction(row["gold_letters"], pred_letters, is_valid)
 
                 results.append({
                     "id": row["id"],
@@ -803,7 +1156,7 @@ def main():
                     "pred_texts": " | ".join(pred_texts),
                     "parse_source": parse_source,
                     "is_valid": int(is_valid),
-                    "correct": int(exact_match),
+                    "correct": int(correct),
                     "outcome": outcome,
                 })
 
@@ -827,6 +1180,8 @@ def main():
             "incorrect_count": incorrect_n,
             "invalid_count": invalid_n,
             "accuracy_pct": pct(correct_n, total_n),
+            "incorrect_pct": pct(incorrect_n, total_n),
+            "invalid_pct": pct(invalid_n, total_n),
             "valid_rate_pct": pct(total_n - invalid_n, total_n),
             "single_n": int(len(df_single)),
             "single_correct_count": int((df_single["outcome"] == "correct").sum()),
