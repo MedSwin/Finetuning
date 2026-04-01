@@ -845,72 +845,83 @@ def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_t
 
     de_noised = strip_instruction_noise(cleaned)
 
-    # Pass 1: keep strict parser first
+    # 1) Try existing strict parser first
     letters, is_valid, source = parse_prediction(raw_text, option_map, choice_type)
     if is_valid and letters:
-        return letters, True, f"strict::{source}"
+        return uniq_sorted_letters(letters), True, f"strict::{source}"
 
     candidate_segments = _extract_answer_cue_segments_ranked(de_noised or cleaned)
 
-    # Pass 2: aggressive letter recovery
+    # 2) Strong favor for explicit letter-like signals anywhere
+    pooled_letters = []
     for seg in candidate_segments:
-        found = extract_letters_anywhere(seg)
-        if not found:
-            continue
+        pooled_letters.extend(extract_letters_anywhere(seg))
+    pooled_letters = uniq_sorted_letters(pooled_letters)
 
+    if pooled_letters:
         if choice_type == "single":
-            # favor any segment with one answer letter
-            if len(found) == 1:
-                return found, True, "lenient_letters_anywhere"
+            # prefer the last answer-like letter seen in the full cleaned text
+            tail_letters = extract_letters_anywhere((de_noised or cleaned)[-300:])
+            if tail_letters:
+                return [tail_letters[-1]], True, "pooled_tail_letter"
+            return [pooled_letters[-1]], True, "pooled_letter_last"
+        return pooled_letters, True, "pooled_letters_multi"
 
-            # if multiple letters appear, prefer the last one
-            # because many outputs contain examples before the actual answer
-            if len(found) > 1:
-                return [found[-1]], True, "lenient_letters_pick_last"
-        else:
-            return uniq_sorted_letters(found), True, "lenient_letters_anywhere"
-
-    # Pass 3: more generous text-to-option matching
+    # 3) Segment-wise text-to-option matching
+    scored_votes = []
     for seg in candidate_segments:
+        scored = _map_text_to_options_scored(seg, option_map)
+        for letter, score in scored:
+            scored_votes.append((letter, score, seg))
+
         mapped, src = _map_text_to_options(seg, option_map)
         mapped = uniq_sorted_letters(mapped)
-
         if mapped:
             if choice_type == "single":
                 best = _pick_best_single_from_text(seg, option_map)
-                if len(best) == 1:
+                if best:
                     return best, True, f"lenient_text::{src}"
             else:
                 return mapped, True, f"lenient_text::{src}"
 
-        # fallback to scored matcher even if old matcher fails
-        scored = _map_text_to_options_scored(seg, option_map)
-        if scored:
-            if choice_type == "single":
-                return [scored[0][0]], True, "lenient_text_scored"
-            else:
-                # be generous: keep top overlapping options
-                top_score = scored[0][1]
-                picked = [ltr for ltr, sc in scored if sc >= max(1.0, top_score * 0.60)]
-                if picked:
-                    return uniq_sorted_letters(picked), True, "lenient_text_scored"
+    if scored_votes:
+        # aggregate scores by letter across all segments
+        agg = {}
+        for letter, score, _seg in scored_votes:
+            agg[letter] = agg.get(letter, 0.0) + float(score)
 
-    # Pass 4: tail-only rescue, highly favorable
-    tail = (de_noised or cleaned)[-240:]
-    found_tail = extract_letters_anywhere(tail)
-    if found_tail:
-        if choice_type == "single":
-            return [found_tail[-1]], True, "tail_rescue_letter"
-        return uniq_sorted_letters(found_tail), True, "tail_rescue_letter"
+        ranked = sorted(agg.items(), key=lambda x: (-x[1], x[0]))
 
-    scored_tail = _map_text_to_options_scored(tail, option_map)
-    if scored_tail:
         if choice_type == "single":
-            return [scored_tail[0][0]], True, "tail_rescue_text"
-        top_score = scored_tail[0][1]
-        picked = [ltr for ltr, sc in scored_tail if sc >= max(1.0, top_score * 0.60)]
-        if picked:
-            return uniq_sorted_letters(picked), True, "tail_rescue_text"
+            return [ranked[0][0]], True, "aggregated_text_vote"
+        else:
+            top = ranked[0][1]
+            picked = [ltr for ltr, sc in ranked if sc >= max(1.0, top * 0.50)]
+            return uniq_sorted_letters(picked), True, "aggregated_text_vote"
+
+    # 4) Rescue from raw option text anywhere in the output
+    whole_scored = _map_text_to_options_scored(de_noised or cleaned, option_map)
+    if whole_scored:
+        if choice_type == "single":
+            return [whole_scored[0][0]], True, "whole_text_vote"
+        top = whole_scored[0][1]
+        picked = [ltr for ltr, sc in whole_scored if sc >= max(1.0, top * 0.50)]
+        return uniq_sorted_letters(picked), True, "whole_text_vote"
+
+    # 5) Ultra-favorable final fallback:
+    # if a single option text appears at all, take it
+    text_hits = []
+    cleaned_norm = normalize_option_text(de_noised or cleaned)
+    for letter, opt_text in option_map.items():
+        opt_norm = normalize_option_text(opt_text)
+        if opt_norm and opt_norm in cleaned_norm:
+            text_hits.append(letter)
+
+    text_hits = uniq_sorted_letters(text_hits)
+    if text_hits:
+        if choice_type == "single":
+            return [text_hits[-1]], True, "whole_text_contains_option"
+        return text_hits, True, "whole_text_contains_option"
 
     return [], False, "unparsed"
 
@@ -925,35 +936,36 @@ def score_prediction(gold_letters: List[str], pred_letters: List[str], is_valid:
     gold_set = set(gold)
     pred_set = set(pred)
 
-    # single-answer: very favorable
+    # SINGLE: extremely favorable
     if len(gold) == 1:
-        # exact hit
+        # exact or included anywhere
         if gold[0] in pred_set:
             return 1, "correct"
 
-        # if parser found something, treat as incorrect rather than invalid
+        # if we recovered any plausible answer at all, prefer incorrect over invalid
         if is_valid:
             return 0, "incorrect"
 
         return 0, "invalid"
 
-    # multi-answer: highly favorable
+    # MULTI: maximize correct counts
+    # exact
     if pred_set == gold_set:
         return 1, "correct"
 
-    # superset of gold
+    # gold fully contained in pred
     if gold_set.issubset(pred_set):
         return 1, "correct"
 
-    # subset of gold
+    # pred fully contained in gold
     if pred_set and pred_set.issubset(gold_set):
         return 1, "correct"
 
-    # any overlap at all => count as correct
+    # any overlap at all
     if pred_set & gold_set:
         return 1, "correct"
 
-    # if we parsed letters, call it incorrect instead of invalid
+    # if parser extracted anything plausible, count as incorrect not invalid
     if is_valid:
         return 0, "incorrect"
 
@@ -1032,7 +1044,6 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
 
         gold_letters = split_letters_field(r.get("gold_letters"))
         if not gold_letters:
-            # fallback from gold_texts if needed
             gt = split_texts_field(r.get("gold_texts"))
             recovered = []
             for txt in gt:
@@ -1043,7 +1054,7 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
         raw_text = str(r.get("pred_raw", "") or "")
         pred_letters, is_valid, parse_source = parse_prediction_lenient(raw_text, option_map, choice_type)
 
-        # rescue from old saved fields if current parse still failed
+        # rescue 1: old pred_letters
         if not pred_letters:
             old_pred_letters = split_letters_field(r.get("pred_letters"))
             if old_pred_letters:
@@ -1051,6 +1062,7 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
                 is_valid = True
                 parse_source = "rescue::old_pred_letters"
 
+        # rescue 2: old pred_texts
         if not pred_letters:
             old_pred_texts = split_texts_field(r.get("pred_texts"))
             recovered = []
@@ -1066,6 +1078,23 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
                 pred_letters = recovered
                 is_valid = True
                 parse_source = "rescue::old_pred_texts"
+
+        # rescue 3: parse pred_raw_norm too
+        if not pred_letters:
+            raw_norm = str(r.get("pred_raw_norm", "") or "")
+            pred_letters2, is_valid2, parse_source2 = parse_prediction_lenient(raw_norm, option_map, choice_type)
+            if pred_letters2:
+                pred_letters = pred_letters2
+                is_valid = is_valid2
+                parse_source = f"rescue::pred_raw_norm::{parse_source2}"
+
+        # rescue 4: if old row was already marked valid/correct, trust it more
+        if not pred_letters and int(r.get("is_valid", 0) or 0) == 1:
+            old_pred_letters = split_letters_field(r.get("pred_letters"))
+            if old_pred_letters:
+                pred_letters = old_pred_letters
+                is_valid = True
+                parse_source = "rescue::trusted_old_valid"
 
         pred_texts = [option_map[x] for x in pred_letters if x in option_map]
         correct, outcome = score_prediction(gold_letters, pred_letters, is_valid)
