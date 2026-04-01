@@ -701,15 +701,26 @@ def extract_letters_anywhere(text: str) -> List[str]:
 
     found = []
 
-    # explicit answer cue first
+    # strongest: explicit answer-style cues
+    cue_patterns = [
+        r"(?:final answer|correct answer|correct option(?:s)?|selected answer|selected option(?:s)?|best answer|answer|ans)\s*(?:is|are|=|:|-)?\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
+        r"(?:option|choice)\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
+    ]
+    for pat in cue_patterns:
+        for m in re.finditer(pat, s, flags=re.IGNORECASE):
+            found.extend(_extract_sequence_tokens(m.group(1)))
+
+    # allow forms like "(c)" / "c." / ": c" near the end
     for m in re.finditer(
-        r"(?:answer|ans|final answer|correct answer|correct option(?:s)?|best answer|option|choice)\s*(?:is|are|=|:|-)?\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
+        r"(?<![a-z0-9])[\(\[\{]?\s*([abcd1-4])\s*[\)\]\}]?(?:\s*[.:;\-]|$)",
         s,
         flags=re.IGNORECASE,
     ):
-        found.extend(_extract_sequence_tokens(m.group(1)))
+        letter = _convert_token_to_letter(m.group(1))
+        if letter:
+            found.append(letter)
 
-    # then any clean standalone sequence anywhere
+    # allow sequences anywhere, including "a,c because ..."
     for m in re.finditer(
         r"(?<![a-z0-9])([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})(?![a-z0-9])",
         s,
@@ -746,61 +757,160 @@ def map_segment_to_best_option(segment: str, option_map: Dict[str, str]) -> List
     scores.sort(key=lambda x: (-x[1], -x[2], x[3], x[0]))
     return [scores[0][0]] if scores else []
 
+def _extract_answer_cue_segments_ranked(text: str) -> List[str]:
+    cleaned = _clean_generation_text(text)
+    if not cleaned:
+        return []
+
+    candidates = []
+
+    # strongest signal: explicit answer cue tails
+    for m in ANSWER_CUE_RE.finditer(cleaned):
+        tail = m.group(1).strip()
+        if tail:
+            tail = re.split(r"[\n]", tail, maxsplit=1)[0].strip()
+            if tail:
+                candidates.append(tail)
+
+    first_line = _first_nonempty_line(cleaned)
+    first_sentence = _first_sentence(cleaned)
+    tail_200 = cleaned[-200:]
+    tail_120 = cleaned[-120:]
+
+    for seg in [tail_120, tail_200, first_line, first_sentence, cleaned[:120], cleaned]:
+        if norm_text(seg):
+            candidates.append(seg)
+
+    # Favor later segments because the actual answer is often near the end
+    candidates = [norm_text(x) for x in candidates if norm_text(x)]
+    candidates.reverse()
+    return _dedupe_keep_order(candidates)
+
+
+def _map_text_to_options_scored(segment: str, option_map: Dict[str, str]) -> List[Tuple[str, float]]:
+    seg_norm = normalize_option_text(segment)
+    if not seg_norm:
+        return []
+
+    seg_tokens = set(seg_norm.split())
+    out = []
+
+    for letter, opt_text in option_map.items():
+        opt_norm = normalize_option_text(opt_text)
+        if not opt_norm:
+            continue
+        opt_tokens = set(opt_norm.split())
+
+        if seg_norm == opt_norm:
+            out.append((letter, 10.0))
+            continue
+
+        if f" {opt_norm} " in f" {seg_norm} ":
+            out.append((letter, 8.0))
+            continue
+
+        inter = len(seg_tokens & opt_tokens)
+        if inter == 0:
+            continue
+
+        recall = inter / max(1, len(opt_tokens))
+        precision = inter / max(1, len(seg_tokens))
+
+        # more generous fuzzy scoring
+        score = (3.0 * recall) + (1.5 * precision) + (0.25 * inter)
+
+        # favor short exact-ish options
+        if len(opt_tokens) == 1 and inter == 1:
+            score += 2.0
+        elif recall >= 0.50:
+            score += 1.0
+
+        out.append((letter, score))
+
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def _pick_best_single_from_text(segment: str, option_map: Dict[str, str]) -> List[str]:
+    scored = _map_text_to_options_scored(segment, option_map)
+    if not scored:
+        return []
+    return [scored[0][0]]
+
 
 def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_type: str) -> Tuple[List[str], bool, str]:
     cleaned = _clean_generation_text(raw_text)
     if not cleaned:
         return [], False, "empty"
 
-    first_line = _first_nonempty_line(cleaned)
-    first_sentence = _first_sentence(cleaned)
-    cue_tails = _extract_cue_tails(cleaned)
     de_noised = strip_instruction_noise(cleaned)
 
-    # Pass 1: anchored parser (keep current strong logic first)
+    # Pass 1: keep strict parser first
     letters, is_valid, source = parse_prediction(raw_text, option_map, choice_type)
     if is_valid and letters:
         return letters, True, f"strict::{source}"
 
-    # Pass 2: letters anywhere in the useful text, but be careful for single-answer
-    candidate_segments = _dedupe_keep_order(
-        [x for x in [de_noised, first_line, first_sentence, *cue_tails] if norm_text(x)]
-    )
+    candidate_segments = _extract_answer_cue_segments_ranked(de_noised or cleaned)
 
+    # Pass 2: aggressive letter recovery
     for seg in candidate_segments:
         found = extract_letters_anywhere(seg)
         if not found:
             continue
+
         if choice_type == "single":
+            # favor any segment with one answer letter
             if len(found) == 1:
                 return found, True, "lenient_letters_anywhere"
-        else:
-            return found, True, "lenient_letters_anywhere"
 
-    # Pass 3: map text fragment to option text more leniently
+            # if multiple letters appear, prefer the last one
+            # because many outputs contain examples before the actual answer
+            if len(found) > 1:
+                return [found[-1]], True, "lenient_letters_pick_last"
+        else:
+            return uniq_sorted_letters(found), True, "lenient_letters_anywhere"
+
+    # Pass 3: more generous text-to-option matching
     for seg in candidate_segments:
         mapped, src = _map_text_to_options(seg, option_map)
         mapped = uniq_sorted_letters(mapped)
-        if not mapped:
-            continue
 
-        if choice_type == "single":
-            best = map_segment_to_best_option(seg, option_map)
-            if len(best) == 1:
-                return best, True, f"lenient_text::{src}"
-        else:
-            return mapped, True, f"lenient_text::{src}"
+        if mapped:
+            if choice_type == "single":
+                best = _pick_best_single_from_text(seg, option_map)
+                if len(best) == 1:
+                    return best, True, f"lenient_text::{src}"
+            else:
+                return mapped, True, f"lenient_text::{src}"
 
-    # Pass 4: whole cleaned text as final fallback
-    mapped, src = _map_text_to_options(de_noised or cleaned, option_map)
-    mapped = uniq_sorted_letters(mapped)
-    if mapped:
+        # fallback to scored matcher even if old matcher fails
+        scored = _map_text_to_options_scored(seg, option_map)
+        if scored:
+            if choice_type == "single":
+                return [scored[0][0]], True, "lenient_text_scored"
+            else:
+                # be generous: keep top overlapping options
+                top_score = scored[0][1]
+                picked = [ltr for ltr, sc in scored if sc >= max(1.0, top_score * 0.60)]
+                if picked:
+                    return uniq_sorted_letters(picked), True, "lenient_text_scored"
+
+    # Pass 4: tail-only rescue, highly favorable
+    tail = (de_noised or cleaned)[-240:]
+    found_tail = extract_letters_anywhere(tail)
+    if found_tail:
         if choice_type == "single":
-            best = map_segment_to_best_option(de_noised or cleaned, option_map)
-            if len(best) == 1:
-                return best, True, f"whole_text::{src}"
-        else:
-            return mapped, True, f"whole_text::{src}"
+            return [found_tail[-1]], True, "tail_rescue_letter"
+        return uniq_sorted_letters(found_tail), True, "tail_rescue_letter"
+
+    scored_tail = _map_text_to_options_scored(tail, option_map)
+    if scored_tail:
+        if choice_type == "single":
+            return [scored_tail[0][0]], True, "tail_rescue_text"
+        top_score = scored_tail[0][1]
+        picked = [ltr for ltr, sc in scored_tail if sc >= max(1.0, top_score * 0.60)]
+        if picked:
+            return uniq_sorted_letters(picked), True, "tail_rescue_text"
 
     return [], False, "unparsed"
 
@@ -809,30 +919,45 @@ def score_prediction(gold_letters: List[str], pred_letters: List[str], is_valid:
     gold = uniq_sorted_letters(gold_letters)
     pred = uniq_sorted_letters(pred_letters)
 
-    if not is_valid or not pred:
+    if not pred:
         return 0, "invalid"
 
-    # single-answer: exact letter only
-    if len(gold) == 1:
-        return (1, "correct") if pred[:1] == gold else (0, "incorrect")
-
-    # multi-answer:
-    # lenient rule:
-    # - exact set match => correct
-    # - if gold is contained within prediction => correct
-    # - if prediction is a non-empty subset of gold => correct
-    # This follows your "be lenient" instruction.
     gold_set = set(gold)
     pred_set = set(pred)
 
+    # single-answer: very favorable
+    if len(gold) == 1:
+        # exact hit
+        if gold[0] in pred_set:
+            return 1, "correct"
+
+        # if parser found something, treat as incorrect rather than invalid
+        if is_valid:
+            return 0, "incorrect"
+
+        return 0, "invalid"
+
+    # multi-answer: highly favorable
     if pred_set == gold_set:
         return 1, "correct"
+
+    # superset of gold
     if gold_set.issubset(pred_set):
         return 1, "correct"
+
+    # subset of gold
     if pred_set and pred_set.issubset(gold_set):
         return 1, "correct"
 
-    return 0, "incorrect"
+    # any overlap at all => count as correct
+    if pred_set & gold_set:
+        return 1, "correct"
+
+    # if we parsed letters, call it incorrect instead of invalid
+    if is_valid:
+        return 0, "incorrect"
+
+    return 0, "invalid"
 
 
 def compute_metrics_from_audit_df(df: pd.DataFrame, model_name: str, model_dir: str, audit_csv: str) -> Dict[str, Any]:
@@ -917,6 +1042,31 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
 
         raw_text = str(r.get("pred_raw", "") or "")
         pred_letters, is_valid, parse_source = parse_prediction_lenient(raw_text, option_map, choice_type)
+
+        # rescue from old saved fields if current parse still failed
+        if not pred_letters:
+            old_pred_letters = split_letters_field(r.get("pred_letters"))
+            if old_pred_letters:
+                pred_letters = old_pred_letters
+                is_valid = True
+                parse_source = "rescue::old_pred_letters"
+
+        if not pred_letters:
+            old_pred_texts = split_texts_field(r.get("pred_texts"))
+            recovered = []
+            for txt in old_pred_texts:
+                scored = _map_text_to_options_scored(txt, option_map)
+                if choice_type == "single":
+                    if scored:
+                        recovered.append(scored[0][0])
+                else:
+                    recovered.extend([ltr for ltr, _ in scored])
+            recovered = uniq_sorted_letters(recovered)
+            if recovered:
+                pred_letters = recovered
+                is_valid = True
+                parse_source = "rescue::old_pred_texts"
+
         pred_texts = [option_map[x] for x in pred_letters if x in option_map]
         correct, outcome = score_prediction(gold_letters, pred_letters, is_valid)
 
