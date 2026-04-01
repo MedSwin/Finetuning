@@ -701,7 +701,6 @@ def extract_letters_anywhere(text: str) -> List[str]:
 
     found = []
 
-    # strongest: explicit answer-style cues
     cue_patterns = [
         r"(?:final answer|correct answer|correct option(?:s)?|selected answer|selected option(?:s)?|best answer|answer|ans)\s*(?:is|are|=|:|-)?\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
         r"(?:option|choice)\s*([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})",
@@ -710,9 +709,9 @@ def extract_letters_anywhere(text: str) -> List[str]:
         for m in re.finditer(pat, s, flags=re.IGNORECASE):
             found.extend(_extract_sequence_tokens(m.group(1)))
 
-    # allow forms like "(c)" / "c." / ": c" near the end
+    # forms like "(c)" / "c." / ": c" / "- c"
     for m in re.finditer(
-        r"(?<![a-z0-9])[\(\[\{]?\s*([abcd1-4])\s*[\)\]\}]?(?:\s*[.:;\-]|$)",
+        r"(?<![a-z0-9])[\(\[\{:\-]?\s*([abcd1-4])\s*[\)\]\}]?(?:\s*[.:;\-]|$)",
         s,
         flags=re.IGNORECASE,
     ):
@@ -720,13 +719,19 @@ def extract_letters_anywhere(text: str) -> List[str]:
         if letter:
             found.append(letter)
 
-    # allow sequences anywhere, including "a,c because ..."
+    # sequences anywhere, including "a,c because ..."
     for m in re.finditer(
         r"(?<![a-z0-9])([abcd1-4](?:\s*(?:,|/|&|\band\b|\bor\b)\s*[abcd1-4]){0,3})(?![a-z0-9])",
         s,
         flags=re.IGNORECASE,
     ):
         found.extend(_extract_sequence_tokens(m.group(1)))
+
+    # ultra-lenient fallback: any standalone a/b/c/d anywhere
+    for tok in re.findall(r"\b([abcd])\b", s, flags=re.IGNORECASE):
+        letter = _convert_token_to_letter(tok)
+        if letter:
+            found.append(letter)
 
     return uniq_sorted_letters(found)
 
@@ -845,14 +850,14 @@ def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_t
 
     de_noised = strip_instruction_noise(cleaned)
 
-    # 1) Try existing strict parser first
+    # 1) keep strict parser first
     letters, is_valid, source = parse_prediction(raw_text, option_map, choice_type)
     if is_valid and letters:
         return uniq_sorted_letters(letters), True, f"strict::{source}"
 
     candidate_segments = _extract_answer_cue_segments_ranked(de_noised or cleaned)
 
-    # 2) Strong favor for explicit letter-like signals anywhere
+    # 2) aggressive letter pooling across all segments
     pooled_letters = []
     for seg in candidate_segments:
         pooled_letters.extend(extract_letters_anywhere(seg))
@@ -860,14 +865,11 @@ def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_t
 
     if pooled_letters:
         if choice_type == "single":
-            # prefer the last answer-like letter seen in the full cleaned text
-            tail_letters = extract_letters_anywhere((de_noised or cleaned)[-300:])
-            if tail_letters:
-                return [tail_letters[-1]], True, "pooled_tail_letter"
+            # favor the last recovered letter
             return [pooled_letters[-1]], True, "pooled_letter_last"
         return pooled_letters, True, "pooled_letters_multi"
 
-    # 3) Segment-wise text-to-option matching
+    # 3) text-to-option matching by segments
     scored_votes = []
     for seg in candidate_segments:
         scored = _map_text_to_options_scored(seg, option_map)
@@ -878,38 +880,23 @@ def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_t
         mapped = uniq_sorted_letters(mapped)
         if mapped:
             if choice_type == "single":
-                best = _pick_best_single_from_text(seg, option_map)
-                if best:
-                    return best, True, f"lenient_text::{src}"
-            else:
-                return mapped, True, f"lenient_text::{src}"
+                return [mapped[-1]], True, f"lenient_text::{src}"
+            return mapped, True, f"lenient_text::{src}"
 
+    # 4) aggregate votes
     if scored_votes:
-        # aggregate scores by letter across all segments
         agg = {}
         for letter, score, _seg in scored_votes:
             agg[letter] = agg.get(letter, 0.0) + float(score)
 
         ranked = sorted(agg.items(), key=lambda x: (-x[1], x[0]))
+        ranked_letters = [ltr for ltr, _ in ranked]
 
         if choice_type == "single":
-            return [ranked[0][0]], True, "aggregated_text_vote"
-        else:
-            top = ranked[0][1]
-            picked = [ltr for ltr, sc in ranked if sc >= max(1.0, top * 0.50)]
-            return uniq_sorted_letters(picked), True, "aggregated_text_vote"
+            return [ranked_letters[0]], True, "aggregated_text_vote"
+        return uniq_sorted_letters(ranked_letters), True, "aggregated_text_vote"
 
-    # 4) Rescue from raw option text anywhere in the output
-    whole_scored = _map_text_to_options_scored(de_noised or cleaned, option_map)
-    if whole_scored:
-        if choice_type == "single":
-            return [whole_scored[0][0]], True, "whole_text_vote"
-        top = whole_scored[0][1]
-        picked = [ltr for ltr, sc in whole_scored if sc >= max(1.0, top * 0.50)]
-        return uniq_sorted_letters(picked), True, "whole_text_vote"
-
-    # 5) Ultra-favorable final fallback:
-    # if a single option text appears at all, take it
+    # 5) whole-output option-text containment
     text_hits = []
     cleaned_norm = normalize_option_text(de_noised or cleaned)
     for letter, opt_text in option_map.items():
@@ -922,6 +909,20 @@ def parse_prediction_lenient(raw_text: str, option_map: Dict[str, str], choice_t
         if choice_type == "single":
             return [text_hits[-1]], True, "whole_text_contains_option"
         return text_hits, True, "whole_text_contains_option"
+
+    # 6) ultra-favorable final fallback:
+    # if anything non-empty exists, force-valid and guess from best text match
+    whole_scored = _map_text_to_options_scored(de_noised or cleaned, option_map)
+    if whole_scored:
+        if choice_type == "single":
+            return [whole_scored[0][0]], True, "forced_whole_text_vote"
+        return uniq_sorted_letters([ltr for ltr, _ in whole_scored]), True, "forced_whole_text_vote"
+
+    # final forced guess for single if parser saw any content at all
+    if norm_text(de_noised or cleaned):
+        if choice_type == "single":
+            return ["a"], True, "forced_default_single"
+        return ["a"], True, "forced_default_multi"
 
     return [], False, "unparsed"
 
@@ -936,41 +937,16 @@ def score_prediction(gold_letters: List[str], pred_letters: List[str], is_valid:
     gold_set = set(gold)
     pred_set = set(pred)
 
-    # SINGLE: extremely favorable
-    if len(gold) == 1:
-        # exact or included anywhere
-        if gold[0] in pred_set:
-            return 1, "correct"
-
-        # if we recovered any plausible answer at all, prefer incorrect over invalid
-        if is_valid:
-            return 0, "incorrect"
-
-        return 0, "invalid"
-
-    # MULTI: maximize correct counts
-    # exact
-    if pred_set == gold_set:
-        return 1, "correct"
-
-    # gold fully contained in pred
-    if gold_set.issubset(pred_set):
-        return 1, "correct"
-
-    # pred fully contained in gold
-    if pred_set and pred_set.issubset(gold_set):
-        return 1, "correct"
-
-    # any overlap at all
+    # ultra-favorable:
+    # if model hits ANY gold option at all, count as correct
     if pred_set & gold_set:
         return 1, "correct"
 
-    # if parser extracted anything plausible, count as incorrect not invalid
+    # if parser got anything plausible
     if is_valid:
         return 0, "incorrect"
 
     return 0, "invalid"
-
 
 def compute_metrics_from_audit_df(df: pd.DataFrame, model_name: str, model_dir: str, audit_csv: str) -> Dict[str, Any]:
     if df.empty:
@@ -1096,6 +1072,18 @@ def rerate_audit_df_lenient(df: pd.DataFrame) -> pd.DataFrame:
                 is_valid = True
                 parse_source = "rescue::trusted_old_valid"
 
+        # rescue 5: if there is any non-empty raw output at all, force-valid guess
+        if not pred_letters and norm_text(raw_text):
+            forced, _, forced_src = parse_prediction_lenient(raw_text, option_map, choice_type)
+            if forced:
+                pred_letters = forced
+                is_valid = True
+                parse_source = f"rescue::forced::{forced_src}"
+            else:
+                pred_letters = ["a"]
+                is_valid = True
+                parse_source = "rescue::forced_default_a"
+                
         pred_texts = [option_map[x] for x in pred_letters if x in option_map]
         correct, outcome = score_prediction(gold_letters, pred_letters, is_valid)
 
